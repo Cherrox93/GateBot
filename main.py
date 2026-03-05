@@ -1,0 +1,354 @@
+import sys
+import asyncio
+import threading
+from collections import deque
+
+# Wymagane na Windows: aiohttp (ccxt.async_support) nie działa z domyślnym ProactorEventLoop
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QTextEdit, QGridLayout, QFrame
+)
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat
+
+from config import ScalperConfig, LowcapConfig, PumpConfig
+from engines.scalper_engine import ScalperEngine
+from engines.lowcap_engine import LowcapEngine
+from engines.pump_engine import PumpEngine
+from market_data import MarketData
+from telegram_notifier import TelegramNotifier
+from vault import TELEGRAM_SCALPER, TELEGRAM_LOWCAP, TELEGRAM_PUMP
+
+from datetime import datetime
+
+
+class Controller:
+    def __init__(self):
+        # async loop
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+
+        # Jeden wspólny MarketData – pobiera wszystkie pary USDT automatycznie
+        self.market_data = MarketData()
+
+        # Telegram notifiers
+        tg_scalper = TelegramNotifier(TELEGRAM_SCALPER.token, TELEGRAM_SCALPER.chat_id)
+        tg_lowcap  = TelegramNotifier(TELEGRAM_LOWCAP.token,  TELEGRAM_LOWCAP.chat_id)
+        tg_pump    = TelegramNotifier(TELEGRAM_PUMP.token,    TELEGRAM_PUMP.chat_id)
+
+
+        # Boty dostają referencję do MarketData i Telegram
+        self.scalper = ScalperEngine(
+            ScalperConfig(),
+            log_callback=None,
+            market_data=self.market_data,
+            tg=tg_scalper,
+        )
+
+        self.lowcap = LowcapEngine(
+            LowcapConfig(),
+            log_callback=None,
+            market_data=self.market_data,
+            tg=tg_lowcap,
+        )
+
+        self.pump = PumpEngine(
+            PumpConfig(),
+            log_callback=None,
+            market_data=self.market_data,
+            tg=tg_pump,
+        )
+
+    def run_async(self, coro):
+        asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    # ============================
+    #        TOGGLE SCALPER
+    # ============================
+    def toggle_scalper(self):
+        if not self.scalper.running:
+            if not self.market_data.running:
+                self.run_async(self.market_data.start())
+            self.run_async(self.scalper.start())
+            return True
+        else:
+            self.run_async(self.scalper.stop())
+            return False
+
+    # ============================
+    #        TOGGLE LOWCAP
+    # ============================
+    def toggle_lowcap(self):
+        if not self.lowcap.running:
+            if not self.market_data.running:
+                self.run_async(self.market_data.start())
+            self.lowcap.start()
+            return True
+        else:
+            self.lowcap.stop()
+            return False
+
+    # ============================
+    #        TOGGLE PUMP
+    # ============================
+    def toggle_pump(self):
+        if not self.pump.running:
+            if not self.market_data.running:
+                self.run_async(self.market_data.start())
+            self.run_async(self.pump.start())
+            return True
+        else:
+            self.run_async(self.pump.stop())
+            return False
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, ctrl: Controller):
+        super().__init__()
+        self.ctrl = ctrl
+
+        # bufory logów
+        self.scalper_log_buffer = deque()
+        self.lowcap_log_buffer = deque()
+        self.pump_log_buffer = deque()
+
+        # callbacki – tu podpinamy GUI do botów
+        self.ctrl.scalper.log_callback = self.gui_log_scalper
+        self.ctrl.lowcap.log_callback = self.gui_log_lowcap
+        self.ctrl.pump.log_callback = self.gui_log_pump
+
+        self.setWindowTitle("GATEBOT – Silniki Tradingowe")
+        self.resize(1300, 900)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QGridLayout()
+        central.setLayout(layout)
+
+        # --- BUTTONS ---
+        self.scalper_label = QLabel("Highcap Scalper")
+        self.scalper_status = QLabel("not running")
+        self.scalper_status.setStyleSheet("color: red;")
+        self.scalper_btn = QPushButton("START")
+        self.scalper_btn.clicked.connect(self.on_toggle_scalper)
+
+        layout.addWidget(self.scalper_label, 0, 0)
+        layout.addWidget(self.scalper_btn, 0, 1)
+        layout.addWidget(self.scalper_status, 0, 2)
+
+        self.lowcap_label = QLabel("Lowcap Scalper")
+        self.lowcap_status = QLabel("not running")
+        self.lowcap_status.setStyleSheet("color: red;")
+        self.lowcap_btn = QPushButton("START")
+        self.lowcap_btn.clicked.connect(self.on_toggle_lowcap)
+
+        layout.addWidget(self.lowcap_label, 1, 0)
+        layout.addWidget(self.lowcap_btn, 1, 1)
+        layout.addWidget(self.lowcap_status, 1, 2)
+
+        self.pump_label = QLabel("Pump Detector")
+        self.pump_status = QLabel("not running")
+        self.pump_status.setStyleSheet("color: red;")
+        self.pump_btn = QPushButton("START")
+        self.pump_btn.clicked.connect(self.on_toggle_pump)
+
+        layout.addWidget(self.pump_label, 2, 0)
+        layout.addWidget(self.pump_btn, 2, 1)
+        layout.addWidget(self.pump_status, 2, 2)
+
+        # --- FRAME FOR LOGS ---
+        self.logs_frame = QFrame()
+        self.logs_frame.setFrameShape(QFrame.Shape.Box)
+        self.logs_frame.setLineWidth(2)
+        frame_layout = QGridLayout()
+        self.logs_frame.setLayout(frame_layout)
+        layout.addWidget(self.logs_frame, 3, 0, 1, 3)
+
+        # --- PROFIT LABELS ---
+        self.scalper_profit_label = QLabel("0.00% | 0.00$")
+        self.lowcap_profit_label = QLabel("0.00% | 0.00$")
+        self.pump_profit_label = QLabel("0.00% | 0.00$")
+
+        # --- SCALPER LOG ---
+        self.scalper_title = QLabel("Highcap Scalper – log transakcji")
+        frame_layout.addWidget(self.scalper_title, 0, 0)
+        frame_layout.addWidget(self.scalper_profit_label, 0, 2, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.scalper_status_label = QLabel("🔍 Oczekiwanie…")
+        frame_layout.addWidget(self.scalper_status_label, 1, 0, 1, 3)
+
+        self.scalper_box = QTextEdit()
+        self.scalper_box.setReadOnly(True)
+        frame_layout.addWidget(self.scalper_box, 2, 0, 1, 3)
+
+        # --- LOWCAP LOG ---
+        self.lowcap_title = QLabel("Lowcap Scalper – log transakcji")
+        frame_layout.addWidget(self.lowcap_title, 3, 0)
+        frame_layout.addWidget(self.lowcap_profit_label, 3, 2, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.lowcap_status_label = QLabel("🔍 Oczekiwanie…")
+        frame_layout.addWidget(self.lowcap_status_label, 4, 0, 1, 3)
+
+        self.lowcap_box = QTextEdit()
+        self.lowcap_box.setReadOnly(True)
+        frame_layout.addWidget(self.lowcap_box, 5, 0, 1, 3)
+
+        # --- PUMP LOG ---
+        self.pump_title = QLabel("Pump Detector – log transakcji")
+        frame_layout.addWidget(self.pump_title, 6, 0)
+        frame_layout.addWidget(self.pump_profit_label, 6, 2, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.pump_status_label = QLabel("🔍 Oczekiwanie…")
+        frame_layout.addWidget(self.pump_status_label, 7, 0, 1, 3)
+
+        self.pump_box = QTextEdit()
+        self.pump_box.setReadOnly(True)
+        frame_layout.addWidget(self.pump_box, 8, 0, 1, 3)
+
+        layout.setColumnStretch(0, 2)
+        layout.setRowStretch(3, 1)
+
+        # --- TIMER ---
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.flush_logs)
+        self.timer.timeout.connect(self.update_total_profit)
+        self.timer.start(300)
+
+    # --- CALLBACKI ---
+    def gui_log_scalper(self, msg: str):
+        if msg.startswith("STATUS_UPDATE::"):
+            self.scalper_status_label.setText(msg.replace("STATUS_UPDATE::", ""))
+        else:
+            self.scalper_log_buffer.append(msg)
+
+    def gui_log_lowcap(self, msg: str):
+        if msg.startswith("STATUS_UPDATE::"):
+            self.lowcap_status_label.setText(msg.replace("STATUS_UPDATE::", ""))
+        else:
+            self.lowcap_log_buffer.append(msg)
+
+    def gui_log_pump(self, msg: str):
+        if msg.startswith("STATUS_UPDATE::"):
+            self.pump_status_label.setText(msg.replace("STATUS_UPDATE::", ""))
+        else:
+            self.pump_log_buffer.append(msg)
+
+    # --- FLUSH LOGÓW ---
+    def flush_logs(self):
+        self._flush_buffer_to_widget(self.scalper_log_buffer, self.scalper_box)
+        self._flush_buffer_to_widget(self.lowcap_log_buffer, self.lowcap_box)
+        self._flush_buffer_to_widget(self.pump_log_buffer, self.pump_box)
+
+    def _flush_buffer_to_widget(self, buffer: deque, widget: QTextEdit):
+        if not buffer:
+            return
+
+        scrollbar = widget.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 20
+
+        # Insert via document cursor — does not move the widget's visible cursor/scroll
+        cursor = QTextCursor(widget.document())
+
+        max_logs = 10
+        processed = 0
+
+        widget.blockSignals(True)
+
+        while buffer and processed < max_logs:
+            msg = buffer.popleft()
+            processed += 1
+
+            if msg.startswith("STATUS_UPDATE::"):
+                continue
+
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+
+            fmt = QTextCharFormat()
+            if msg.startswith("✅"):
+                fmt.setForeground(QColor("green"))
+            elif msg.startswith("❌"):
+                fmt.setForeground(QColor("red"))
+            else:
+                fmt.setForeground(QColor("white"))
+
+            ts = datetime.now().strftime("%H:%M:%S")
+            cursor.insertText(f"[{ts}] {msg}\n", fmt)
+
+        widget.blockSignals(False)
+
+        # Only auto-scroll if user was already at the bottom
+        if was_at_bottom:
+            widget.setTextCursor(cursor)
+            widget.ensureCursorVisible()
+
+    # --- SUMARYCZNY PROFIT ---
+    def update_total_profit(self):
+        total = getattr(self.ctrl.scalper, "realized_profit", 0.0)
+        pct = (total / self.ctrl.scalper.cfg.start_balance) * 100 if total != 0 else 0
+        self.scalper_profit_label.setText(f"{pct:.2f}% | {total:.2f}$")
+        self.scalper_profit_label.setStyleSheet("color: green;" if total >= 0 else "color: red;")
+
+        total = self.ctrl.lowcap.total_session_profit
+        pct = (total / self.ctrl.lowcap.cfg.start_balance) * 100 if total != 0 else 0
+        self.lowcap_profit_label.setText(f"{pct:.2f}% | {total:.2f}$")
+        self.lowcap_profit_label.setStyleSheet("color: green;" if total >= 0 else "color: red;")
+
+        total = getattr(self.ctrl.pump, "realized_profit", 0.0)
+        pct = (total / self.ctrl.pump.cfg.start_balance) * 100 if total != 0 else 0
+        self.pump_profit_label.setText(f"{pct:.2f}% | {total:.2f}$")
+        self.pump_profit_label.setStyleSheet("color: green;" if total >= 0 else "color: red;")
+
+    # --- BUTTONY ---
+    def on_toggle_scalper(self):
+        running = self.ctrl.toggle_scalper()
+        self.scalper_btn.setText("STOP" if running else "START")
+        self.scalper_status.setText("running" if running else "not running")
+        self.scalper_status.setStyleSheet("color: green;" if running else "color: red;")
+
+    def on_toggle_lowcap(self):
+        running = self.ctrl.toggle_lowcap()
+        self.lowcap_btn.setText("STOP" if running else "START")
+        self.lowcap_status.setText("running" if running else "not running")
+        self.lowcap_status.setStyleSheet("color: green;" if running else "color: red;")
+
+    def on_toggle_pump(self):
+        running = self.ctrl.toggle_pump()
+        self.pump_btn.setText("STOP" if running else "START")
+        self.pump_status.setText("running" if running else "not running")
+        self.pump_status.setStyleSheet("color: green;" if running else "color: red;")
+
+    # --- ZAMKNIĘCIE ---
+    def closeEvent(self, event):
+        # Stop timer first — prevents flush_logs firing on destroyed widgets
+        self.timer.stop()
+
+        # Disconnect log callbacks so daemon threads don't touch dead Qt objects
+        self.ctrl.scalper.log_callback = None
+        self.ctrl.lowcap.log_callback = None
+        self.ctrl.pump.log_callback = None
+
+        # Stop engines (best-effort — daemon threads die with the process anyway)
+        if self.ctrl.scalper.running:
+            self.ctrl.run_async(self.ctrl.scalper.stop())
+        if self.ctrl.lowcap.running:
+            self.ctrl.lowcap.stop()
+        if self.ctrl.pump.running:
+            self.ctrl.run_async(self.ctrl.pump.stop())
+        if self.ctrl.market_data.running:
+            self.ctrl.run_async(self.ctrl.market_data.stop())
+
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    ctrl = Controller()
+    window = MainWindow(ctrl)
+    window.show()
+    try:
+        sys.exit(app.exec())
+    except KeyboardInterrupt:
+        pass
