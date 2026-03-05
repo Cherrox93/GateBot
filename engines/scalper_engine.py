@@ -350,7 +350,9 @@ class ScalperEngine:
         qty = risk_usd / sl_distance if sl_distance > 0 else 0.0
         stake = qty * price
 
-        stake = min(stake, self.balance_usdt, self.cfg.max_stake_usd)
+        equity = self.get_total_equity()
+        max_stake = equity * self.cfg.first_stake_pct
+        stake = min(max_stake, self.balance_usdt, self.cfg.max_stake_usd)
         stake = max(stake, 0.0)
         qty = stake / price if price > 0 else 0.0
 
@@ -524,7 +526,9 @@ class ScalperEngine:
         # Basic gates
         if now < self.cooldowns.get(symbol, 0):
             return
-        if len(self.active_positions) >= self.cfg.slot_count:
+        equity = self.get_total_equity()
+        dynamic_slots = 5 if equity >= 600 else 3
+        if len(self.active_positions) >= dynamic_slots:
             return
         if self._daily_limit_hit():
             return

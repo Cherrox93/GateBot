@@ -43,8 +43,8 @@ class ScalperConfig:
     fee: float = 0.002
 
     # Position management
-    slot_count: int = 4
-    first_stake_pct: float = 0.10
+    slot_count: int = 3
+    first_stake_pct: float = 0.20
     max_stake_usd: float = 50.0          # górny limit na jedną pozycję
     max_total_exposure: float = 0.70     # max 70% kapitału w otwartych pozycjach
 
