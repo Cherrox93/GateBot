@@ -128,7 +128,7 @@ class BotState:
         self.name = name
         self.running = False
         self.status = "🔍 Oczekiwanie…"
-        self.logs: deque = deque(maxlen=200)
+        self.logs: deque = deque(maxlen=100)
         self.pnl_history: list = []   # [{"ts": unix, "pnl": float}]
         self.trades: list = []        # historia transakcji
         self.wins = 0
@@ -256,6 +256,8 @@ def make_log_callback(state: BotState):
                         "ts": int(time.time() * 1000),
                         "pnl": round(state.realized_profit, 2)
                     })
+                    if len(state.pnl_history) > 200:
+                        state.pnl_history = state.pnl_history[-200:]
                     if pnl >= 0:
                         state.wins += 1
                     else:
@@ -266,8 +268,8 @@ def make_log_callback(state: BotState):
                         "pnl": pnl,
                         "win": pnl >= 0
                     })
-                    if len(state.trades) > 100:
-                        state.trades = state.trades[:100]
+                    if len(state.trades) > 50:
+                        state.trades = state.trades[:50]
                 except Exception:
                     pass
 
@@ -454,6 +456,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=False,
-        log_level="info",
+        log_level="warning",
+        access_log=False,
         timeout_graceful_shutdown=5,
     )
