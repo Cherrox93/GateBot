@@ -54,17 +54,17 @@ class ScalperConfig:
     ema_macro: int = 50
 
     # Entry scoring
-    min_score: int = 50
+    min_score: int = 45
     min_body_ratio: float = 0.45
     max_upper_wick_ratio: float = 0.30
     min_atr_pct: float = 0.002
 
     # Risk management (ATR-based)
     risk_per_trade_pct: float = 0.005    # 0.5% equity risked per trade
-    atr_sl_multiplier: float = 1.2       # SL = entry - 1.2 * ATR
-    atr_trail_multiplier: float = 1.2    # trailing stop distance = 1.2 * ATR
-    tp1_r_multiple: float = 1.8          # TP1 = entry + 1.8 * SL_distance
-    runner_activation_r: float = 1.5     # runner trail activates at +1.5R
+    atr_sl_multiplier: float = 0.9       # SL = entry - 0.9 * ATR
+    atr_trail_multiplier: float = 1.0    # trailing stop distance = 1.0 * ATR
+    tp1_r_multiple: float = 1.0          # TP1 = entry + 1.0 * SL_distance
+    runner_activation_r: float = 1.3     # runner trail activates at +1.3R
     tp1_qty_pct: float = 0.65            # sell 65% at TP1, run 35%
 
     # Regime / alt breadth
@@ -75,20 +75,20 @@ class ScalperConfig:
 
     # Entry filters
     entry_body_ratio: float = 0.45       # min body/range ratio for entry candle
-    entry_vol_mult: float = 1.4          # volume must be > 1.4x rolling mean
+    entry_vol_mult: float = 1.8          # volume must be > 1.8x rolling mean
     entry_breakout_factor: float = 1.001 # close must be > prev_high * 1.001
 
     # Circuit breaker (rolling WR)
     rolling_wr_window: int = 10          # look at last N closed trades
-    rolling_wr_min: float = 0.30         # pause if WR drops below 30%
+    rolling_wr_min: float = 0.25         # pause if WR drops below 25%
     rolling_wr_pause: float = 7200.0     # 2h pause when WR circuit fires
 
     # Per-scan throttle
     max_entries_per_scan: int = 2        # max new entries per main loop iteration
 
     # Timing
-    cooldown_seconds: float = 30.0
-    ohlcv_cache_ttl: float = 10.0    # odświeżaj OHLCV co 10 sekund
+    cooldown_seconds: float = 60.0
+    ohlcv_cache_ttl: float = 20.0    # odświeżaj OHLCV co 20 sekund
 
     # Daily loss limit
     daily_loss_limit_pct: float = 0.05  # stop gdy dzienna strata > 5% start_balance
@@ -142,7 +142,7 @@ class LowcapConfig:
     max_stake_per_trade: float = 50.0
     stake_pct: float = 0.10
 
-    vol_min: int = 300_000
+    vol_min: int = 600_000
     vol_max: int = 5_000_000
     price_min: float = 0.001
 
@@ -152,8 +152,8 @@ class LowcapConfig:
     hard_sl_pct: float = 0.011          # fixed -1.1% SL instead of broken ATR-based
     cooldown_after_sl: float = 180.0
 
-    m1_ema_fast: int = 3
-    m1_ema_slow: int = 7
+    m1_ema_fast: int = 5
+    m1_ema_slow: int = 13
 
     m5_ema_fast: int = 20
     m5_ema_slow: int = 50
@@ -174,7 +174,7 @@ class LowcapConfig:
     break_high_factor: float = 0.9985
     break_close_factor: float = 0.996
 
-    target_profit: float = 0.020        # 1.2% → 2.0%  (better RR ratio)
+    target_profit: float = 0.015        # 2.0% → 1.5%
     micro_tp: float = 0.008             # 1.2% → 0.8%
     trailing_stop: float = 0.008        # 0.6% → 0.8%  (runner survives small pullbacks)
     break_even: float = 0.006           # 0.35% → 0.6%
@@ -192,7 +192,7 @@ class LowcapConfig:
     dyn_wr_high: float = 0.63
     dyn_wr_top: float = 0.68
 
-    scan_limit: int = 30
+    scan_limit: int = 20
     loop_sleep: float = 0.10
     cooldown_seconds: float = 60.0      # re-enter faster after wins
 
@@ -205,7 +205,7 @@ class LowcapConfig:
 
     # Circuit breaker
     max_consecutive_losses: int = 3
-    consecutive_loss_pause: float = 5400.0   # 90 minutes pause after 3 SL in a row
+    consecutive_loss_pause: float = 1800.0   # 30 minutes pause after 3 SL in a row
 
     # Entry filters
     max_spread_pct: float = 0.0025          # max 0.25% spread at entry

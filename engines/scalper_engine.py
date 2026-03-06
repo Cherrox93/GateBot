@@ -216,8 +216,7 @@ class ScalperEngine:
 
             trend_ok = (
                 float(btc_ema21.iloc[-1]) > float(btc_ema50.iloc[-1])
-                and float(btc_ema50.iloc[-1]) > float(btc_ema50.iloc[-3])
-                and btc_atr_pct >= 0.002
+                or btc_atr_pct >= 0.003
             )
 
             # Strong BTC volume impulse overrides borderline trend
@@ -314,7 +313,7 @@ class ScalperEngine:
             atr_ser = ta.atr(df1["h"], df1["l"], df1["c"], length=7)
             atr_val = float(atr_ser.iloc[-1])
             atr_pct = atr_val / price if price > 0 else 0.0
-            if 0.0025 <= atr_pct <= 0.02:
+            if 0.003 <= atr_pct <= 0.020:
                 score += 15
 
             # Strong EMA50 slope
@@ -353,78 +352,6 @@ class ScalperEngine:
         qty = stake / price if price > 0 else 0.0
 
         return stake, qty, sl_price, sl_distance
-
-    # ============================
-    #        ENTRY SCORING
-    # ============================
-    async def compute_entry_score(self, symbol: str, price: float):
-        """Zwraca (score 0-100, features_dict) lub (0, None) przy błędzie."""
-        try:
-            ohlcv_1m = await self._get_ohlcv(symbol, "1m", 60)
-            ohlcv_5m = await self._get_ohlcv(symbol, "5m", 60)
-
-            if len(ohlcv_1m) < 22 or len(ohlcv_5m) < 51:
-                return 0, None
-
-            df1 = pd.DataFrame(ohlcv_1m, columns=["ts", "o", "h", "l", "c", "v"])
-            df5 = pd.DataFrame(ohlcv_5m, columns=["ts", "o", "h", "l", "c", "v"])
-
-            score = 0
-
-            # --- EMA alignment M1 + M5 (+20) ---
-            ema9    = ta.ema(df1["c"], length=self.cfg.ema_fast)
-            ema21_1 = ta.ema(df1["c"], length=self.cfg.ema_slow)
-            ema21_5 = ta.ema(df5["c"], length=self.cfg.ema_slow)
-            ema50_5 = ta.ema(df5["c"], length=self.cfg.ema_macro)
-
-            m1_ok = float(ema9.iloc[-1]) > float(ema21_1.iloc[-1])
-            m5_ok = float(ema21_5.iloc[-1]) > float(ema50_5.iloc[-1])
-            if m1_ok and m5_ok:
-                score += 20
-
-            # EMA50 slope filter — uptrend confirmation
-            if len(ema50_5) >= 3:
-                ema50_prev = float(ema50_5.iloc[-3])
-                ema50_now  = float(ema50_5.iloc[-1])
-                if ema50_now > ema50_prev:
-                    score += 10
-
-            # --- Volume burst (+20) ---
-            vol_mean = df1["v"].rolling(10).mean().iloc[-1]
-            vol_ratio = float(df1["v"].iloc[-1]) / vol_mean if vol_mean > 0 else 0.0
-            if vol_ratio >= self.cfg.entry_vol_mult:
-                score += 20
-
-            # --- Czysty korpus świecy > 50% (+15) ---
-            last = df1.iloc[-1]
-            candle_range = last["h"] - last["l"]
-            body = abs(last["c"] - last["o"])
-            body_ratio = body / candle_range if candle_range > 0 else 0.0
-            if body_ratio >= 0.50:
-                score += 15
-
-            # --- Breakout powyżej poprzedniego high (+15) ---
-            prev_high = float(df1["h"].iloc[-2])
-            if float(last["c"]) > prev_high * 1.002:
-                score += 15
-
-            # --- ATR w optymalnym zakresie (+15) ---
-            atr_ser = ta.atr(df1["h"], df1["l"], df1["c"], length=7)
-            atr_pct = float(atr_ser.iloc[-1]) / price if price > 0 else 0.0
-            if 0.0025 <= atr_pct <= 0.02:
-                score += 15
-
-            # --- Brak górnego cienia < 30% (+15) ---
-            upper_wick = last["h"] - max(last["o"], last["c"])
-            uw_ratio = upper_wick / candle_range if candle_range > 0 else 1.0
-            if uw_ratio < self.cfg.max_upper_wick_ratio:
-                score += 15
-
-            return score, {}
-
-        except Exception as e:
-            self.log(f"score error {symbol}: {e}")
-            return 0, None
 
     # ============================
     #        EXIT LOGIC

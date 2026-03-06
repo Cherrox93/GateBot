@@ -871,7 +871,7 @@ function updateBotUI(bot, b) {
   // Trades
   if (b.trades) {
     b.trades.forEach(t => {
-      const tradeId = `${bot}_${t.ts}_${t.msg}`;
+      const tradeId = `${bot}_${t.msg}`;
       if (!allTrades.find(x => x._id === tradeId)) {
         allTrades.unshift({...t, bot, _id: tradeId});
       }
@@ -935,7 +935,7 @@ function appendLog(bot, ts, msg) {
     try {
       const pnl = parseFloat(msg.split('PnL:')[1].split('$')[0]);
       const ts2 = new Date().toLocaleTimeString('pl-PL');
-      const tradeId = `${bot}_${ts2}_${msg}`;
+      const tradeId = `${bot}_${msg}`;
       if (!allTrades.find(x => x._id === tradeId)) {
         allTrades.unshift({ts: ts2, msg, pnl, win: pnl >= 0, bot, _id: tradeId});
       }

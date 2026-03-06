@@ -60,6 +60,9 @@ class LowcapEngine:
         self.stop_event = threading.Event()
         self.thread = None
 
+        self._ohlcv_cache = {}   # {(symbol, timeframe): {"data": list, "ts": float}}
+        self._ohlcv_cache_ttl = 20.0  # sekundy
+
         self.ai_db = self.load_ai_db()
         self.last_prices = {}
         self.log_callback = log_callback
@@ -299,6 +302,19 @@ class LowcapEngine:
         return True
 
     # ============================
+    #         OHLCV CACHE
+    # ============================
+    def _get_ohlcv_cached(self, symbol: str, timeframe: str, limit: int) -> list:
+        key = (symbol, timeframe)
+        now = time.monotonic()
+        cached = self._ohlcv_cache.get(key)
+        if cached and (now - cached["ts"]) < self._ohlcv_cache_ttl:
+            return cached["data"]
+        data = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        self._ohlcv_cache[key] = {"data": data, "ts": now}
+        return data
+
+    # ============================
     #         GŁÓWNA PĘTLA
     # ============================
     def loop(self):
@@ -457,14 +473,33 @@ class LowcapEngine:
 
                     random.shuffle(candidates)
 
+                    btc_regime_ok = True
+                    try:
+                        btc_ohlcv = self.exchange.fetch_ohlcv("BTC/USDT", "5m", 20)
+                        if btc_ohlcv and len(btc_ohlcv) >= 15:
+                            btc_df = pd.DataFrame(btc_ohlcv,
+                                columns=["ts", "open", "high", "low", "close", "vol"])
+                            btc_atr = ta.atr(btc_df["high"], btc_df["low"],
+                                btc_df["close"], length=14)
+                            btc_price = float(btc_df["close"].iloc[-1])
+                            btc_atr_pct = float(btc_atr.iloc[-1]) / btc_price
+                            if btc_atr_pct < self.cfg.btc_min_atr_pct:
+                                btc_regime_ok = False
+                    except Exception:
+                        pass
+
                     for s in candidates[:self.cfg.scan_limit]:
                         if self.stop_event.is_set():
+                            break
+
+                        if not btc_regime_ok:
+                            self.set_status("💤 BTC martwy — pomijam skanowanie")
                             break
 
                         try:
                             # Wyświetla tylko parę, która faktycznie wchodzi w analizę techniczną
                             self.set_status(f"Analiza M1: {s}")
-                            ohlcv = self.exchange.fetch_ohlcv(s, '1m', limit=50)
+                            ohlcv = self._get_ohlcv_cached(s, '1m', 50)
                             if not ohlcv:
                                 continue
 
@@ -474,7 +509,7 @@ class LowcapEngine:
 
                             # M5 trend confirmation: EMA9 > EMA21 > EMA50, slope EMA21 positive
                             try:
-                                ohlcv_5m = self.exchange.fetch_ohlcv(s, '5m', limit=60)
+                                ohlcv_5m = self._get_ohlcv_cached(s, '5m', 60)
                                 if ohlcv_5m and len(ohlcv_5m) >= 51:
                                     df5 = pd.DataFrame(ohlcv_5m, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
                                     ema9_5  = ta.ema(df5['close'], length=9)
@@ -506,25 +541,6 @@ class LowcapEngine:
 
                             final_score = self.ai_score_boost(base_score, {"vol_ratio": v_ratio, "atr": atr_pct})
                             threshold = self.dynamic_score_threshold() + self.cfg.score_threshold_boost
-
-                            # BTC regime filter: lowcaps don't move without BTC volatility
-                            try:
-                                btc_ohlcv = self.exchange.fetch_ohlcv("BTC/USDT", "5m", 20)
-                                if btc_ohlcv and len(btc_ohlcv) >= 15:
-                                    btc_df = pd.DataFrame(
-                                        btc_ohlcv,
-                                        columns=['ts', 'open', 'high', 'low', 'close', 'vol']
-                                    )
-                                    btc_atr = ta.atr(
-                                        btc_df['high'], btc_df['low'], btc_df['close'], length=14
-                                    )
-                                    btc_price = float(btc_df['close'].iloc[-1])
-                                    btc_atr_pct = float(btc_atr.iloc[-1]) / btc_price
-                                    if btc_atr_pct < self.cfg.btc_min_atr_pct:
-                                        self.set_status("💤 BTC martwy — pomijam skanowanie")
-                                        break  # skip all candidates if market is dead
-                            except Exception:
-                                pass  # if BTC data unavailable, continue normally
 
                             if final_score >= threshold:
                                 # Get real entry price (ask) not last
