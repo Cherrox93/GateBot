@@ -871,8 +871,9 @@ function updateBotUI(bot, b) {
   // Trades
   if (b.trades) {
     b.trades.forEach(t => {
-      if (!allTrades.find(x => x.ts === t.ts && x.msg === t.msg)) {
-        allTrades.unshift({...t, bot});
+      const tradeId = `${bot}_${t.ts}_${t.msg}`;
+      if (!allTrades.find(x => x._id === tradeId)) {
+        allTrades.unshift({...t, bot, _id: tradeId});
       }
     });
     renderHistory();
@@ -934,7 +935,10 @@ function appendLog(bot, ts, msg) {
     try {
       const pnl = parseFloat(msg.split('PnL:')[1].split('$')[0]);
       const ts2 = new Date().toLocaleTimeString('pl-PL');
-      allTrades.unshift({ts: ts2, msg, pnl, win: pnl >= 0, bot});
+      const tradeId = `${bot}_${ts2}_${msg}`;
+      if (!allTrades.find(x => x._id === tradeId)) {
+        allTrades.unshift({ts: ts2, msg, pnl, win: pnl >= 0, bot, _id: tradeId});
+      }
       if (allTrades.length > 200) allTrades.length = 200;
       renderHistory();
 
@@ -1080,14 +1084,18 @@ function updateWRDonut() {
 // ═══════════════════════════════
 function renderHistory() {
   const tbody = document.getElementById('trade-history');
-  tbody.innerHTML = allTrades.slice(0,100).map(t => `
+  tbody.innerHTML = allTrades.slice(0,100).map(t => {
+    const botColor = {scalper:'#00cfff', lowcap:'#00ff88', pump:'#ffe000'}[t.bot] || '#ffffff';
+    return `
     <tr>
       <td style="color:var(--text-dim)">${t.ts}</td>
       <td><span class="badge ${t.win ? 'win':'loss'}">${t.win ? 'WIN':'LOSS'}</span></td>
-      <td style="color:var(--text);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(t.msg)}</td>
+      <td style="color:var(--text);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        <span style="font-size:10px;letter-spacing:1px;padding:2px 6px;border:1px solid ${botColor};color:${botColor};margin-right:8px;font-family:var(--font-ui);font-weight:700">${t.bot ? t.bot.toUpperCase() : ''}</span>${escHtml(t.msg)}
+      </td>
       <td style="color:${t.pnl>=0?'var(--neon-g)':'var(--neon-r)'}">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}$</td>
-    </tr>
-  `).join('');
+    </tr>`;
+  }).join('');
   updateWRDonut();
 }
 
