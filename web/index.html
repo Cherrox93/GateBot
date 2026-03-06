@@ -785,6 +785,7 @@ function showApp() {
   document.getElementById('app').style.display = 'block';
   initCharts();
   loadState();
+  loadLogs();
   connectWS();
   fetchPortfolio();
   loadSettings();
@@ -793,6 +794,34 @@ function showApp() {
     setInterval(loadState, 10000);
     setInterval(fetchPortfolio, 5000);
   }
+}
+
+async function loadLogs() {
+  for (const bot of ['scalper', 'lowcap', 'pump']) {
+    try {
+      const logs = await apiFetch(`/api/logs/${bot}`);
+      if (!Array.isArray(logs)) continue;
+      const panel = document.getElementById(`log-${bot}`);
+      if (!panel) continue;
+      panel.innerHTML = '';
+      logs.forEach(entry => addLogEntry(bot, entry.ts, entry.msg));
+    } catch {}
+  }
+}
+
+function addLogEntry(bot, ts, msg) {
+  const panel = document.getElementById(`log-${bot}`);
+  if (!panel) return;
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  if (msg.includes('💰 BUY'))  div.classList.add('buy');
+  else if (msg.includes('✅')) div.classList.add('sell-win');
+  else if (msg.includes('❌')) div.classList.add('sell-loss');
+  else div.classList.add('info');
+  div.innerHTML = `<span class="log-ts">[${ts}]</span><span class="log-msg">${escHtml(msg)}</span>`;
+  panel.appendChild(div);
+  while (panel.children.length > 300) panel.removeChild(panel.firstChild);
+  panel.scrollTop = panel.scrollHeight;
 }
 
 // ═══════════════════════════════

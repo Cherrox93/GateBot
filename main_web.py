@@ -58,6 +58,28 @@ async def lifespan(app: FastAPI):
     print(f"[GateBot] Dashboard dostępny na http://0.0.0.0:8000", flush=True)
     print(f"[GateBot] Login: {WEB_USERNAME} / {WEB_PASSWORD}", flush=True)
     yield
+    print("[GateBot] Zatrzymywanie botów...", flush=True)
+    if scalper_state.running and scalper_engine:
+        try:
+            await scalper_engine.stop()
+        except Exception:
+            pass
+    if lowcap_state.running and lowcap_engine:
+        try:
+            lowcap_engine.stop()
+        except Exception:
+            pass
+    if pump_state.running and pump_engine:
+        try:
+            await pump_engine.stop()
+        except Exception:
+            pass
+    if market_data and market_data.running:
+        try:
+            await market_data.stop()
+        except Exception:
+            pass
+    print("[GateBot] Zamknięto.", flush=True)
 
 app = FastAPI(title="GateBot Dashboard", lifespan=lifespan)
 security = HTTPBearer()
@@ -432,5 +454,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=False,
-        log_level="info"
+        log_level="info",
+        timeout_graceful_shutdown=5,
     )
