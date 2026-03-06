@@ -37,7 +37,7 @@ def _fmt(price: float) -> str:
 
 class ScalperEngine:
     def __init__(self, cfg: ScalperConfig, log_callback=None,
-                 market_data: MarketData | None = None, tg=None):
+                 market_data: MarketData | None = None, tg=None, portfolio=None):
         self.cfg = cfg
 
         # Sync ccxt — działa na Windows (requests, nie aiohttp)
@@ -49,6 +49,7 @@ class ScalperEngine:
 
         self.market_data = market_data
         self.tg = tg
+        self.portfolio = portfolio
         self.balance_usdt = self.cfg.start_balance
 
         # {symbol: position_dict}
@@ -118,7 +119,8 @@ class ScalperEngine:
         return sum(p["original_stake"] for p in self.active_positions.values())
 
     def get_total_equity(self) -> float:
-        return self.balance_usdt + self.get_total_exposure()
+        bal = self.portfolio.balance_usdt if self.portfolio else self.balance_usdt
+        return bal + self.get_total_exposure()
 
     # ============================
     #        DAILY LIMIT
@@ -153,7 +155,7 @@ class ScalperEngine:
         lines = [
             "📊 *HIGHCAP SCALPER*",
             "━━━━━━━━━━━━━━━━━",
-            f"💰 Balance: *{self.balance_usdt:.2f}$*",
+            f"💰 Balance: *{(self.portfolio.balance_usdt if self.portfolio else self.balance_usdt):.2f}$*",
             f"📈 Equity: *{equity:.2f}$*",
             f"📊 Win Rate: W:{self.wins}/L:{self.losses} ({win_pct}%)",
             f"🔓 Otwarte pozycje ({len(self.active_positions)}/{self.cfg.slot_count}):",
@@ -312,7 +314,7 @@ class ScalperEngine:
             atr_ser = ta.atr(df1["h"], df1["l"], df1["c"], length=7)
             atr_val = float(atr_ser.iloc[-1])
             atr_pct = atr_val / price if price > 0 else 0.0
-            if 0.004 <= atr_pct <= 0.018:
+            if 0.0025 <= atr_pct <= 0.02:
                 score += 15
 
             # Strong EMA50 slope
@@ -342,17 +344,11 @@ class ScalperEngine:
         SL = entry - atr_sl_multiplier * ATR
         Returns (stake, qty, sl_price, sl_distance)
         """
-        equity = self.get_total_equity()
-        risk_usd = equity * self.cfg.risk_per_trade_pct
         sl_distance = self.cfg.atr_sl_multiplier * atr_val
         sl_price = price - sl_distance
 
-        qty = risk_usd / sl_distance if sl_distance > 0 else 0.0
-        stake = qty * price
-
-        equity = self.get_total_equity()
-        max_stake = equity * self.cfg.first_stake_pct
-        stake = min(max_stake, self.balance_usdt, self.cfg.max_stake_usd)
+        avail = self.portfolio.balance_usdt if self.portfolio else self.balance_usdt
+        stake = min(self.cfg.max_stake_usd, avail)
         stake = max(stake, 0.0)
         qty = stake / price if price > 0 else 0.0
 
@@ -415,7 +411,7 @@ class ScalperEngine:
             # --- ATR w optymalnym zakresie (+15) ---
             atr_ser = ta.atr(df1["h"], df1["l"], df1["c"], length=7)
             atr_pct = float(atr_ser.iloc[-1]) / price if price > 0 else 0.0
-            if 0.004 <= atr_pct <= 0.018:
+            if 0.0025 <= atr_pct <= 0.02:
                 score += 15
 
             # --- Brak górnego cienia < 30% (+15) ---
@@ -479,7 +475,10 @@ class ScalperEngine:
         cost_basis = sell_qty * pos["entry"]
         pnl = received - cost_basis
 
-        self.balance_usdt += received
+        if self.portfolio:
+            self.portfolio.balance_usdt += received
+        else:
+            self.balance_usdt += received
         self.realized_profit += pnl
         self.daily_realized += pnl
         pos["accumulated_pnl"] += pnl
@@ -506,7 +505,7 @@ class ScalperEngine:
 
             # Re-entry guard: remember SL price so we don't re-enter below it
             if reason_label == "🔴 SL":
-                self._last_sl_price[symbol] = pos["entry"]
+                self._last_sl_price[symbol] = pos["sl_price"]
 
             tg_msg  += f" | {self._wr_text()}"
             gui_msg += f" | {self._wr_text()}"
@@ -592,7 +591,10 @@ class ScalperEngine:
             "score":             score,
             "entry_time":        now,
         }
-        self.balance_usdt -= stake
+        if self.portfolio:
+            self.portfolio.balance_usdt -= stake
+        else:
+            self.balance_usdt -= stake
         self._entries_this_scan += 1
 
         sl_pct  = sl_distance / price * 100

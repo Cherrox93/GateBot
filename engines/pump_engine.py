@@ -31,11 +31,12 @@ def send_telegram(msg, token, chat_id):
 
 class PumpEngine:
     def __init__(self, cfg: PumpConfig, log_callback=None,
-                 market_data: MarketData | None = None, tg=None):
+                 market_data: MarketData | None = None, tg=None, portfolio=None):
         self.cfg = cfg
         self.log_callback = log_callback
         self.market_data = market_data
         self.tg = tg
+        self.portfolio = portfolio
 
         # Sync ccxt — działa na Windows (requests, nie aiohttp)
         self.exchange = ccxt.gateio({
@@ -104,7 +105,7 @@ class PumpEngine:
         lines = [
             "📊 *PUMP DETECTOR*",
             "━━━━━━━━━━━━━━━━━",
-            f"💰 Balance: *{self.balance_in_wallet:.2f}$*",
+            f"💰 Balance: *{(self.portfolio.balance_usdt if self.portfolio else self.balance_in_wallet):.2f}$*",
             f"📈 Equity: *{equity:.2f}$*",
             f"📊 Win Rate: W:{self.wins}/L:{self.losses} ({win_pct}%)",
             f"🔓 Otwarte pozycje ({len(self.active_positions)}/{self.cfg.max_positions}):",
@@ -129,7 +130,8 @@ class PumpEngine:
     # ============================
     def get_total_equity(self):
         locked = sum(pos['stake'] for pos in self.active_positions.values())
-        return self.balance_in_wallet + locked
+        bal = self.portfolio.balance_usdt if self.portfolio else self.balance_in_wallet
+        return bal + locked
 
     # ============================
     #        DAILY LIMIT
@@ -468,7 +470,8 @@ class PumpEngine:
                             else self.cfg.entry_score_threshold
                         )
                         if score >= effective_threshold:
-                            stake = min(self.cfg.max_stake, self.balance_in_wallet)
+                            avail = self.portfolio.balance_usdt if self.portfolio else self.balance_in_wallet
+                            stake = min(self.cfg.max_stake, avail)
                             if stake >= self.cfg.min_stake_usd:
                                 # Anti-churn: don't re-enter below last profitable exit price
                                 last_good_price = self.ticker_memory[symbol].get("last_good_exit_price")
@@ -491,7 +494,10 @@ class PumpEngine:
                                     "score": score,
                                     "features": feat
                                 }
-                                self.balance_in_wallet -= stake
+                                if self.portfolio:
+                                    self.portfolio.balance_usdt -= stake
+                                else:
+                                    self.balance_in_wallet -= stake
 
                                 self.set_status(f"🚀 BUY {symbol}")
                                 buy_msg = f"💰 BUY {symbol} | Entry Price: {price} | Stawka: {stake:.2f}$"
@@ -545,7 +551,10 @@ class PumpEngine:
                         pnl_usd = sell_value - pos["stake"]
                         pnl_percent = round(profit * 100, 2)
 
-                        self.balance_in_wallet += sell_value
+                        if self.portfolio:
+                            self.portfolio.balance_usdt += sell_value
+                        else:
+                            self.balance_in_wallet += sell_value
                         self.realized_profit += pnl_usd
                         self.daily_realized += pnl_usd
 

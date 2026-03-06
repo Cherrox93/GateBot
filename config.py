@@ -54,7 +54,7 @@ class ScalperConfig:
     ema_macro: int = 50
 
     # Entry scoring
-    min_score: int = 60
+    min_score: int = 50
     min_body_ratio: float = 0.45
     max_upper_wick_ratio: float = 0.30
     min_atr_pct: float = 0.002
@@ -74,9 +74,9 @@ class ScalperConfig:
     alt_breadth_cache_ttl: float = 300.0 # seconds to cache alt breadth result
 
     # Entry filters
-    entry_body_ratio: float = 0.60       # min body/range ratio for entry candle
-    entry_vol_mult: float = 2.0          # volume must be > 2x rolling mean
-    entry_breakout_factor: float = 1.002 # close must be > prev_high * 1.002
+    entry_body_ratio: float = 0.45       # min body/range ratio for entry candle
+    entry_vol_mult: float = 1.4          # volume must be > 1.4x rolling mean
+    entry_breakout_factor: float = 1.001 # close must be > prev_high * 1.001
 
     # Circuit breaker (rolling WR)
     rolling_wr_window: int = 10          # look at last N closed trades
@@ -84,16 +84,16 @@ class ScalperConfig:
     rolling_wr_pause: float = 7200.0     # 2h pause when WR circuit fires
 
     # Per-scan throttle
-    max_entries_per_scan: int = 1        # max new entries per main loop iteration
+    max_entries_per_scan: int = 2        # max new entries per main loop iteration
 
     # Timing
-    cooldown_seconds: float = 60.0
+    cooldown_seconds: float = 30.0
     ohlcv_cache_ttl: float = 10.0    # odświeżaj OHLCV co 10 sekund
 
     # Daily loss limit
     daily_loss_limit_pct: float = 0.05  # stop gdy dzienna strata > 5% start_balance
 
-    # 15 najlepszych gigantów do skalpowania
+    # 30 coinów do skalpowania
     gigants: tuple = (
         "BTC/USDT",
         "ETH/USDT",
@@ -109,7 +109,22 @@ class ScalperConfig:
         "DOT/USDT",
         "NEAR/USDT",
         "UNI/USDT",
-        "ATOM/USDT"
+        "ATOM/USDT",
+        "FIL/USDT",
+        "ICP/USDT",
+        "APT/USDT",
+        "ARB/USDT",
+        "OP/USDT",
+        "INJ/USDT",
+        "SUI/USDT",
+        "TIA/USDT",
+        "SEI/USDT",
+        "WLD/USDT",
+        "PEPE/USDT",
+        "SHIB/USDT",
+        "FLOKI/USDT",
+        "BONK/USDT",
+        "WIF/USDT",
     )
 
 

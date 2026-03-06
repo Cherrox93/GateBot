@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-jose[cryptography]
+pydantic
+requests
+urllib3
+ccxt
+pandas
+pandas-ta
+websockets
+PyQt6
+python-dotenv

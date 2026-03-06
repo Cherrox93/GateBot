@@ -34,10 +34,11 @@ def send_telegram(msg, token, chat_id):
 
 class LowcapEngine:
     def __init__(self, cfg: LowcapConfig, log_callback=None,
-                 market_data: MarketData | None = None, tg=None):
+                 market_data: MarketData | None = None, tg=None, portfolio=None):
         self.cfg = cfg
         self.market_data = market_data
         self.tg = tg
+        self.portfolio = portfolio
 
         self.exchange = ccxt.gateio({
             'apiKey': EXCHANGE.api_key,
@@ -106,13 +107,14 @@ class LowcapEngine:
         return f"W:{self.wins} L:{self.losses} WR:{wr:.0f}%"
 
     def get_status_text(self) -> str:
-        equity = self.balance + sum(p['stake'] for p in self.active_positions.values())
+        bal = self.portfolio.balance_usdt if self.portfolio else self.balance
+        equity = bal + sum(p['stake'] for p in self.active_positions.values())
         total = self.wins + self.losses
         win_pct = f"{self.wins / total * 100:.0f}" if total > 0 else "0"
         lines = [
             "📊 *LOWCAP SCALPER*",
             "━━━━━━━━━━━━━━━━━",
-            f"💰 Balance: *{self.balance:.2f}$*",
+            f"💰 Balance: *{bal:.2f}$*",
             f"📈 Equity: *{equity:.2f}$*",
             f"📊 Win Rate: W:{self.wins}/L:{self.losses} ({win_pct}%)",
             f"🔓 Otwarte pozycje ({len(self.active_positions)}/{self.cfg.max_positions}):",
@@ -398,7 +400,10 @@ class LowcapEngine:
                         net = sell_value - (sell_value * self.cfg.fee)
                         gain = net - pos['stake']
 
-                        self.balance += net
+                        if self.portfolio:
+                            self.portfolio.balance_usdt += net
+                        else:
+                            self.balance += net
                         self.total_session_profit += gain
 
                         win = gain > 0
@@ -438,7 +443,8 @@ class LowcapEngine:
                 # ---------- BUY LOGIC ----------
                 max_pos = self.cfg.max_positions
 
-                if self.balance >= self.cfg.min_stake_usd and len(self.active_positions) < max_pos and time.time() >= self.pause_until:
+                avail_bal = self.portfolio.balance_usdt if self.portfolio else self.balance
+                if avail_bal >= self.cfg.min_stake_usd and len(self.active_positions) < max_pos and time.time() >= self.pause_until:
                     
                     # 🔥 OPTYMALIZACJA: Ogólny status zamiast wszystkich par w kółko
                     self.set_status(f"Analiza M1 - Skanowanie ({len(self.all_symbols)} par)")
@@ -534,8 +540,8 @@ class LowcapEngine:
 
                                 self.set_status(f"💰 BUY {s}")
 
-                                stake = self.cfg.start_balance * self.cfg.stake_pct
-                                stake = min(stake, self.cfg.max_stake_per_trade)
+                                avail = self.portfolio.balance_usdt if self.portfolio else self.balance
+                                stake = min(self.cfg.max_stake_per_trade, avail)
 
                                 if stake >= self.cfg.min_stake_usd:
                                     self.active_positions[s] = {
@@ -548,7 +554,10 @@ class LowcapEngine:
                                         "sl_locked": False,
                                     }
 
-                                    self.balance -= stake
+                                    if self.portfolio:
+                                        self.portfolio.balance_usdt -= stake
+                                    else:
+                                        self.balance -= stake
 
                                     buy_msg = f"💰 BUY {s} | Entry Price: {ask_price:.8f} | Stawka: {stake:.2f}$"
                                     self.gui_log(buy_msg)
