@@ -39,6 +39,7 @@ from engines.pump_engine import PumpEngine
 from market_data import MarketData
 from telegram_notifier import TelegramNotifier
 from vault import TELEGRAM_SCALPER, TELEGRAM_LOWCAP, TELEGRAM_PUMP
+from analytics_engine import get_analytics, get_all_analytics
 
 # ═══════════════════════════════════════
 #   KONFIGURACJA
@@ -416,6 +417,16 @@ def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_token)):
     save_setting_db(bot, req.stake_usd, req.max_slots)
     apply_settings_to_engines({bot: {"stake_usd": req.stake_usd, "max_slots": req.max_slots}})
     return {"ok": True}
+
+@app.get("/api/analytics")
+def get_analytics_data(bot: str = "scalper", user=Depends(verify_token)):
+    if bot not in ("scalper", "lowcap", "pump"):
+        raise HTTPException(404, "Bot nie istnieje")
+    try:
+        analytics = get_analytics(bot)
+        return analytics.get_dashboard_data()
+    except Exception as e:
+        return {"error": str(e), "bot": bot, "trade_count": 0}
 
 # ═══════════════════════════════════════
 #   WEBSOCKET

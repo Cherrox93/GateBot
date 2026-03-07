@@ -54,18 +54,18 @@ class ScalperConfig:
     ema_macro: int = 50
 
     # Entry scoring
-    min_score: int = 45
+    min_score: int = 55
     min_body_ratio: float = 0.45
     max_upper_wick_ratio: float = 0.30
     min_atr_pct: float = 0.002
 
     # Risk management (ATR-based)
     risk_per_trade_pct: float = 0.005    # 0.5% equity risked per trade
-    atr_sl_multiplier: float = 0.9       # SL = entry - 0.9 * ATR
-    atr_trail_multiplier: float = 1.0    # trailing stop distance = 1.0 * ATR
-    tp1_r_multiple: float = 1.0          # TP1 = entry + 1.0 * SL_distance
-    runner_activation_r: float = 1.3     # runner trail activates at +1.3R
-    tp1_qty_pct: float = 0.65            # sell 65% at TP1, run 35%
+    atr_sl_multiplier: float = 1.5       # SL = entry - 1.5 * ATR
+    atr_trail_multiplier: float = 1.5    # trailing stop distance = 1.5 * ATR
+    tp1_r_multiple: float = 2.0          # TP1 = entry + 2.0 * SL_distance
+    runner_activation_r: float = 2.5     # runner trail activates at +2.5R
+    tp1_qty_pct: float = 0.60            # sell 60% at TP1, run 40%
 
     # Regime / alt breadth
     btc_breakout_vol_mult: float = 1.5   # BTC vol spike counts as green light
@@ -80,15 +80,15 @@ class ScalperConfig:
 
     # Circuit breaker (rolling WR)
     rolling_wr_window: int = 10          # look at last N closed trades
-    rolling_wr_min: float = 0.25         # pause if WR drops below 25%
-    rolling_wr_pause: float = 7200.0     # 2h pause when WR circuit fires
+    rolling_wr_min: float = 0.20         # pause if WR drops below 20%
+    rolling_wr_pause: float = 3600.0     # 1h pause when WR circuit fires
 
     # Per-scan throttle
     max_entries_per_scan: int = 2        # max new entries per main loop iteration
 
     # Timing
     cooldown_seconds: float = 60.0
-    ohlcv_cache_ttl: float = 20.0    # odświeżaj OHLCV co 20 sekund
+    ohlcv_cache_ttl: float = 15.0    # odświeżaj OHLCV co 15 sekund
 
     # Daily loss limit
     daily_loss_limit_pct: float = 0.05  # stop gdy dzienna strata > 5% start_balance
@@ -174,9 +174,9 @@ class LowcapConfig:
     break_high_factor: float = 0.9985
     break_close_factor: float = 0.996
 
-    target_profit: float = 0.015        # 2.0% → 1.5%
-    micro_tp: float = 0.008             # 1.2% → 0.8%
-    trailing_stop: float = 0.008        # 0.6% → 0.8%  (runner survives small pullbacks)
+    target_profit: float = 0.018        # 1.5% → 1.8%
+    micro_tp: float = 0.010             # 0.8% → 1.0%
+    trailing_stop: float = 0.005        # 0.8% → 0.5%
     break_even: float = 0.006           # 0.35% → 0.6%
 
     min_reentry_price: float = 0.005
@@ -205,7 +205,8 @@ class LowcapConfig:
 
     # Circuit breaker
     max_consecutive_losses: int = 3
-    consecutive_loss_pause: float = 1800.0   # 30 minutes pause after 3 SL in a row
+    consecutive_loss_pause: float = 5400.0   # 90 minutes pause after 3 SL in a row
+    sl_reentry_block_seconds: float = 3600.0
 
     # Entry filters
     max_spread_pct: float = 0.0025          # max 0.25% spread at entry
@@ -252,6 +253,7 @@ class PumpConfig:
 
     # Exit — Moon Hunter: daj moonie żyć
     hard_sl: float = -0.07
+    max_sl_pct: float = 0.035            # twardy cap SL: max 3.5% od entry
     base_trailing: float = -0.020
     trailing_min_profit: float = 0.03
     trailing_mid_profit: float = 0.08
@@ -260,10 +262,26 @@ class PumpConfig:
     trailing_high_drop: float = -0.10
     time_exit_seconds: float = 360.0
 
+    # Dynamiczny trailing stop — progi zysku
+    trail_tier1_pct: float = 0.05         # do 5% zysku
+    trail_tier2_pct: float = 0.15         # do 15% zysku
+    trail_tier3_pct: float = 0.40         # do 40% zysku
+
+    # Trailing distance per tier
+    trail_distance_tier1: float = 0.015   # 1.5%
+    trail_distance_tier2: float = 0.030   # 3.0%
+    trail_distance_tier3: float = 0.050   # 5.0%
+    trail_distance_tier4: float = 0.080   # 8.0% dla 40%+
+
+    # Minimalna odległość od high żeby wyjść
+    hard_exit_from_high: float = 0.15     # 15% od szczytu
+
     quick_exit_seconds: float = 120.0      # check for failed pump after 2 min
     quick_exit_threshold: float = -0.005   # exit if profit < -0.5% after 2 min
+    quick_exit_min_loss: float = 0.015     # min 1.5% straty żeby QUICK exit zadziałał
     max_entries_per_coin_per_day: int = 2  # max 2 entries per coin per session
     cooldown_after_sl: float = 1800.0      # 30 min cooldown after SL on that coin
+    sl_reentry_block_seconds: float = 7200.0  # 2h blokada re-entry po SL
 
     fee_rate: float = 0.002
     start_balance: float = 50.0

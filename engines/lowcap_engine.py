@@ -15,6 +15,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from config import LowcapConfig, EXCHANGE
 from market_data import MarketData
 from vault import TELEGRAM_LOWCAP
+from analytics_engine import get_analytics
 
 
 def send_telegram(msg, token, chat_id):
@@ -36,6 +37,8 @@ class LowcapEngine:
     def __init__(self, cfg: LowcapConfig, log_callback=None,
                  market_data: MarketData | None = None, tg=None, portfolio=None):
         self.cfg = cfg
+        self.analytics = get_analytics('lowcap')
+        self._trade_ids: dict = {}
         self.market_data = market_data
         self.tg = tg
         self.portfolio = portfolio
@@ -51,7 +54,8 @@ class LowcapEngine:
         self.cooldowns = {}
         self.total_session_profit = 0.0
         self.consecutive_losses = 0
-        self.pause_until = 0.0
+        self._pause_until: float = 0.0
+        self._last_sl_symbols: dict = {}
         self.balance = self.cfg.start_balance
         self.wins = 0
         self.losses = 0
@@ -432,8 +436,11 @@ class LowcapEngine:
                             if reason == "🔴 SL":
                                 self.consecutive_losses += 1
                                 if self.consecutive_losses >= self.cfg.max_consecutive_losses:
-                                    self.pause_until = time.time() + self.cfg.consecutive_loss_pause
-                                    pause_msg = f"⏸️ {self.cfg.max_consecutive_losses} SL z rzędu — pauza 90 minut"
+                                    self._pause_until = (
+                                        time.monotonic()
+                                        + self.cfg.consecutive_loss_pause
+                                    )
+                                    pause_msg = f"⏸️ {self.cfg.max_consecutive_losses} SL z rzędu — pauza {int(self.cfg.consecutive_loss_pause // 60)} minut"
                                     self.log(pause_msg)
                                     self.gui_log(pause_msg)
                             else:
@@ -446,6 +453,22 @@ class LowcapEngine:
                         sell_msg = f"{icon} SELL {s} | {reason} | Entry: {entry_price:.8f} | Sell: {sell_price:.8f} | PnL: {gain:.2f}$ | {wr}"
                         self.gui_log(sell_msg)
                         self._send_tg(sell_msg)
+
+                        # ── ML Analytics: rejestracja wyjścia ──
+                        _tid_lc = self._trade_ids.pop(s, None)
+                        if _tid_lc:
+                            self.analytics.on_exit(
+                                trade_id=_tid_lc,
+                                exit_reason=reason,
+                                pnl=gain,
+                                pnl_pct=gain / pos['stake'] if pos['stake'] > 0 else 0,
+                            )
+
+                        if reason == "🔴 SL":
+                            self._last_sl_symbols[s] = (
+                                time.monotonic()
+                                + self.cfg.sl_reentry_block_seconds
+                            )
 
                         to_remove.append(s)
                         if reason == "🔴 SL":
@@ -460,8 +483,14 @@ class LowcapEngine:
                 max_pos = self.cfg.max_positions
 
                 avail_bal = self.portfolio.balance_usdt if self.portfolio else self.balance
-                if avail_bal >= self.cfg.min_stake_usd and len(self.active_positions) < max_pos and time.time() >= self.pause_until:
-                    
+                if avail_bal >= self.cfg.min_stake_usd and len(self.active_positions) < max_pos:
+
+                    if time.monotonic() < self._pause_until:
+                        remaining = int(self._pause_until - time.monotonic())
+                        self.set_status(f"⏸️ Pauza ochronna — {remaining}s")
+                        time.sleep(5)
+                        continue
+
                     # 🔥 OPTYMALIZACJA: Ogólny status zamiast wszystkich par w kółko
                     self.set_status(f"Analiza M1 - Skanowanie ({len(self.all_symbols)} par)")
 
@@ -470,6 +499,16 @@ class LowcapEngine:
                         ticker_data = all_tickers.get(s)
                         if ticker_data and self.passes_market_filters(s, ticker_data):
                             candidates.append(s)
+
+                    _EXCLUDED = [
+                        'USD1', 'USDC', 'BUSD', 'DAI', 'TUSD',
+                        'FDUSD', 'PAXG', 'XAUT', 'USDD', 'FRAX',
+                        'USDT', 'USDP',
+                    ]
+                    candidates = [
+                        s for s in candidates
+                        if not any(p in s.replace('/USDT', '') for p in _EXCLUDED)
+                    ]
 
                     random.shuffle(candidates)
 
@@ -491,6 +530,9 @@ class LowcapEngine:
                     for s in candidates[:self.cfg.scan_limit]:
                         if self.stop_event.is_set():
                             break
+
+                        if time.monotonic() < self._last_sl_symbols.get(s, 0):
+                            continue
 
                         if not btc_regime_ok:
                             self.set_status("💤 BTC martwy — pomijam skanowanie")
@@ -560,6 +602,36 @@ class LowcapEngine:
                                 stake = min(self.cfg.max_stake_per_trade, avail)
 
                                 if stake >= self.cfg.min_stake_usd:
+                                    # ── ML Analytics: rejestracja wejścia ──
+                                    _features_lc = {
+                                        'score':             final_score,
+                                        'vol_ratio':         v_ratio,
+                                        'body_ratio':        0.5,
+                                        'atr_pct':           atr_pct,
+                                        'upper_wick_ratio':  0.2,
+                                        'breakout_strength': 1.002,
+                                        'ema9_slope':        0.0,
+                                        'ema21_slope':       0.0,
+                                        'ema_spread':        0.0,
+                                        'btc_trend':         1 if btc_regime_ok else -1,
+                                        'btc_atr_pct':       0.0,
+                                        'btc_vol_ratio':     1.0,
+                                    }
+                                    _ml_lc = self.analytics.on_entry(
+                                        symbol=s, entry_price=ask_price, stake=stake,
+                                        sl_pct=self.cfg.hard_sl_pct,
+                                        tp1_pct=self.cfg.target_profit,
+                                        features=_features_lc,
+                                    )
+                                    self._trade_ids[s] = _ml_lc['trade_id']
+
+                                    if self.analytics.is_symbol_blocked(s):
+                                        continue
+                                    _ml_blocked_lc, _ml_reason_lc = self.analytics.is_trading_blocked()
+                                    if _ml_blocked_lc:
+                                        self.set_status(f"🤖 {_ml_reason_lc}")
+                                        continue
+
                                     self.active_positions[s] = {
                                         "buy": ask_price,
                                         "max": ask_price,

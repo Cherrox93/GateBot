@@ -493,6 +493,7 @@
     <button class="tab-btn" onclick="switchTab('pozycje')">POZYCJE</button>
     <button class="tab-btn" onclick="switchTab('ustawienia')">USTAWIENIA</button>
     <button class="tab-btn" onclick="switchTab('historia')">HISTORIA</button>
+    <button class="tab-btn" onclick="switchTab('analytics')">🤖 ANALITYKA</button>
   </nav>
 
   <div class="content">
@@ -719,6 +720,53 @@
         </thead>
         <tbody id="trade-history"></tbody>
       </table>
+    </div>
+
+    <!-- ══ ANALITYKA ══ -->
+    <div class="tab-panel" id="tab-analytics">
+
+      <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center">
+        <span style="color:#888">Bot:</span>
+        <select id="analytics-bot-select" onchange="loadAnalytics()"
+          style="background:#1a1a2e;color:#fff;border:1px solid #333;
+                 padding:6px 12px;border-radius:6px;cursor:pointer">
+          <option value="scalper">🔵 Highcap Scalper</option>
+          <option value="lowcap">🟢 Lowcap Scalper</option>
+          <option value="pump">🟡 Pump Detector</option>
+        </select>
+      </div>
+
+      <div class="card">
+        <h3>🤖 Status ML</h3>
+        <div id="ml-status-content"></div>
+      </div>
+
+      <div class="card">
+        <h3>🚦 Aktywne korekty ML</h3>
+        <div id="ml-rules-content"></div>
+      </div>
+
+      <div class="card">
+        <h3>⏰ Win Rate per godzina</h3>
+        <div id="hour-heatmap" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:8px"></div>
+      </div>
+
+      <div style="display:flex;gap:16px">
+        <div class="card" style="flex:1">
+          <h3>✅ Najlepsze symbole</h3>
+          <div id="top-symbols"></div>
+        </div>
+        <div class="card" style="flex:1">
+          <h3>❌ Najgorsze symbole</h3>
+          <div id="worst-symbols"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>🔬 Ważność cech ML</h3>
+        <div id="feature-importance"></div>
+      </div>
+
     </div>
 
   </div><!-- /content -->
@@ -1159,6 +1207,7 @@ function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById(`tab-${name}`).classList.add('active');
   event.target.classList.add('active');
+  if (name === 'analytics') loadAnalytics();
 }
 
 // ═══════════════════════════════
@@ -1203,6 +1252,106 @@ async function saveSetting(bot) {
   }
   setTimeout(() => { fb.textContent = ''; }, 3000);
 }
+
+// ═══════════════════════════════
+//   ANALYTICS
+// ═══════════════════════════════
+async function loadAnalytics() {
+  const bot = document.getElementById('analytics-bot-select')?.value || 'scalper';
+  const d = await apiFetch('/api/analytics?bot=' + bot);
+  if (!d) return;
+
+  // ML Status
+  const lvlColor = {1:'#888', 2:'#00cfff', 3:'#00ff88', 4:'#ffe000'};
+  const col = lvlColor[d.ml_level] || '#888';
+  document.getElementById('ml-status-content').innerHTML = `
+    <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+      <span style="color:${col};font-weight:bold">Poziom ${d.ml_level}: ${d.ml_level_name}</span>
+      <span style="color:#888;font-size:12px">${d.ml_auc > 0 ? 'AUC: ' + d.ml_auc : ''}</span>
+    </div>
+    <div style="background:#0d0d1a;border-radius:6px;height:16px;overflow:hidden;margin-bottom:8px">
+      <div style="background:linear-gradient(90deg,${col},${col}88);width:${d.ml_progress}%;height:100%;transition:width 1s;border-radius:6px"></div>
+    </div>
+    <div style="display:flex;gap:20px;font-size:13px;color:#aaa">
+      <span>📊 Transakcji: <b style="color:#fff">${d.trade_count}</b></span>
+      <span>🏆 WR: <b style="color:#fff">${d.win_rate}%</b></span>
+      <span>💰 PnL: <b style="color:${d.total_pnl>=0?'#00ff88':'#ff4444'}">${d.total_pnl > 0 ? '+' : ''}${d.total_pnl}$</b></span>
+      ${d.next_level_at
+        ? `<span style="color:#555">Następny poziom za <b style="color:#aaa">${d.next_level_at - d.trade_count}</b> transakcji</span>`
+        : '<span style="color:#00ff88">✅ Max poziom aktywny</span>'}
+    </div>
+  `;
+
+  // Aktywne reguły
+  const adj = d.active_adjustments;
+  let rules = '';
+  if (adj.blocked)
+    rules += `<div style="color:#ff4444;padding:4px 0">🚫 ${escHtml(adj.block_reason)}</div>`;
+  if (adj.score_delta > 0)
+    rules += `<div style="color:#ffaa00;padding:4px 0">⚠️ Próg score: +${adj.score_delta} (zaostrzony)</div>`;
+  if (adj.score_delta < 0)
+    rules += `<div style="color:#00ff88;padding:4px 0">✅ Próg score: ${adj.score_delta} (poluzowany)</div>`;
+  if (adj.vol_delta > 0)
+    rules += `<div style="color:#ffaa00;padding:4px 0">📊 Vol multiplier: +${adj.vol_delta.toFixed(1)}</div>`;
+  if (adj.blacklist.length > 0)
+    rules += `<div style="color:#ff6666;padding:4px 0">🚫 Blacklista: ${adj.blacklist.map(escHtml).join(', ')}</div>`;
+  if (adj.whitelist.length > 0)
+    rules += `<div style="color:#00ff88;padding:4px 0">⭐ Preferowane: ${adj.whitelist.map(escHtml).join(', ')}</div>`;
+  if (!rules)
+    rules = '<div style="color:#555">Brak aktywnych korekt — warunki neutralne</div>';
+  document.getElementById('ml-rules-content').innerHTML = rules;
+
+  // Heatmapa godzin
+  let heat = '';
+  for (let h = 0; h < 24; h++) {
+    const hd = d.hour_wr[h];
+    let clr = '#222', label = '—', cnt = '';
+    if (hd) {
+      label = hd.wr + '%';
+      cnt = hd.total + 't';
+      clr = hd.wr >= 60 ? '#00ff88' : hd.wr >= 45 ? '#ffaa00' : '#ff4444';
+    }
+    heat += `<div style="width:50px;height:52px;background:#111;border:1px solid ${clr}33;border-radius:4px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10px">
+      <div style="color:#555">${String(h).padStart(2,'0')}h</div>
+      <div style="color:${clr};font-weight:bold">${label}</div>
+      <div style="color:#333;font-size:9px">${cnt}</div>
+    </div>`;
+  }
+  document.getElementById('hour-heatmap').innerHTML = heat;
+
+  // Symbole
+  const mkRow = (s, good) => `
+    <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #111;font-size:13px">
+      <span style="color:#ccc">${escHtml(s.symbol)}</span>
+      <span style="color:${good?'#00ff88':'#ff4444'}">${s.wr}% <span style="color:#555">(${s.total})</span></span>
+    </div>`;
+  document.getElementById('top-symbols').innerHTML =
+    d.symbol_wr.slice(0,5).map(s => mkRow(s, true)).join('') ||
+    '<div style="color:#555;font-size:12px">Za mało danych (min 5 transakcji per symbol)</div>';
+  document.getElementById('worst-symbols').innerHTML =
+    d.worst_symbols.map(s => mkRow(s, false)).join('') ||
+    '<div style="color:#555;font-size:12px">Za mało danych</div>';
+
+  // Feature importance
+  const fi = d.feature_importance;
+  const fiArr = Object.entries(fi).sort((a,b) => b[1]-a[1]).slice(0,10);
+  document.getElementById('feature-importance').innerHTML =
+    fiArr.length > 0
+      ? fiArr.map(([k, v]) => `
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;font-size:12px">
+            <div style="width:130px;color:#888">${escHtml(k)}</div>
+            <div style="flex:1;background:#0d0d1a;border-radius:3px;height:12px">
+              <div style="background:#00cfff;width:${(v*100).toFixed(0)}%;height:100%;border-radius:3px"></div>
+            </div>
+            <div style="width:35px;color:#00cfff;text-align:right">${(v*100).toFixed(0)}%</div>
+          </div>`).join('')
+      : '<div style="color:#555">Dostępne od Poziomu 2 (200 transakcji)</div>';
+}
+
+setInterval(() => {
+  const panel = document.getElementById('tab-analytics');
+  if (panel && panel.classList.contains('active')) loadAnalytics();
+}, 60000);
 
 // Intervals are started in showApp() after login
 </script>

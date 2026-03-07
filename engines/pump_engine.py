@@ -12,6 +12,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from config import PumpConfig, EXCHANGE
 from market_data import MarketData
 from vault import TELEGRAM_PUMP
+from analytics_engine import get_analytics
 
 
 def send_telegram(msg, token, chat_id):
@@ -33,6 +34,8 @@ class PumpEngine:
     def __init__(self, cfg: PumpConfig, log_callback=None,
                  market_data: MarketData | None = None, tg=None, portfolio=None):
         self.cfg = cfg
+        self.analytics = get_analytics('pump')
+        self._trade_ids: dict = {}
         self.log_callback = log_callback
         self.market_data = market_data
         self.tg = tg
@@ -49,6 +52,7 @@ class PumpEngine:
         self.ticker_memory = {}
         self.active_positions = {}
         self.cooldowns = {}
+        self._sl_blocked_symbols: dict = {}
         self.balance_in_wallet = cfg.start_balance
         self.active_tasks = {}
         self.running = False
@@ -94,6 +98,20 @@ class PumpEngine:
             return "W:0 L:0"
         wr = self.wins / total * 100
         return f"W:{self.wins} L:{self.losses} WR:{wr:.0f}%"
+
+    # ============================
+    #        DYNAMIC TRAILING
+    # ============================
+    def _get_trail_distance(self, entry_price: float, current_price: float) -> float:
+        gain_pct = (current_price - entry_price) / entry_price
+        if gain_pct < self.cfg.trail_tier1_pct:
+            return self.cfg.trail_distance_tier1
+        elif gain_pct < self.cfg.trail_tier2_pct:
+            return self.cfg.trail_distance_tier2
+        elif gain_pct < self.cfg.trail_tier3_pct:
+            return self.cfg.trail_distance_tier3
+        else:
+            return self.cfg.trail_distance_tier4
 
     # ============================
     #        STATUS COMMAND
@@ -450,6 +468,7 @@ class PumpEngine:
 
                 if (symbol not in self.active_positions
                         and now > self.cooldowns.get(symbol, 0)
+                        and time.monotonic() >= self._sl_blocked_symbols.get(symbol, 0)
                         and len(self.active_positions) < self.cfg.max_positions
                         and not self._daily_limit_hit()
                         and mem_entry["entries_today"] < self.cfg.max_entries_per_coin_per_day):
@@ -480,6 +499,38 @@ class PumpEngine:
 
                                 # Increment per-coin entry counter
                                 self.ticker_memory[symbol]["entries_today"] += 1
+
+                                # ── ML Analytics: rejestracja wejścia ──
+                                _vol_avg = self.ticker_memory[symbol].get("avg_vol_10m", 1) or 1
+                                _vol_cur = self.ticker_memory[symbol].get("last_vol", 0)
+                                _features_pump = {
+                                    'score':             score,
+                                    'vol_ratio':         _vol_cur / _vol_avg,
+                                    'body_ratio':        0.5,
+                                    'atr_pct':           0.020,
+                                    'upper_wick_ratio':  0.2,
+                                    'breakout_strength': 1.003,
+                                    'ema9_slope':        0.0,
+                                    'ema21_slope':       0.0,
+                                    'ema_spread':        0.0,
+                                    'btc_trend':         0,
+                                    'btc_atr_pct':       0.0,
+                                    'btc_vol_ratio':     1.0,
+                                }
+                                _ml_pump = self.analytics.on_entry(
+                                    symbol=symbol, entry_price=price, stake=stake,
+                                    sl_pct=abs(getattr(self.cfg, 'hard_sl', -0.05)),
+                                    tp1_pct=getattr(self.cfg, 'trailing_min_profit', 0.08),
+                                    features=_features_pump,
+                                )
+                                self._trade_ids[symbol] = _ml_pump['trade_id']
+
+                                _ml_blocked_p, _ml_reason_p = self.analytics.is_trading_blocked()
+                                if _ml_blocked_p:
+                                    self.log(f"🤖 {_ml_reason_p}")
+                                    continue
+                                if self.analytics.is_symbol_blocked(symbol):
+                                    continue
 
                                 qty = stake / price
                                 self.active_positions[symbol] = {
@@ -522,25 +573,27 @@ class PumpEngine:
                     drop_from_max = (price / pos["max_price"]) - 1
 
                     exit_reason = None
-                    if raw_profit <= self.cfg.hard_sl:
+                    if raw_profit <= self.cfg.hard_sl or raw_profit <= -self.cfg.max_sl_pct:
                         exit_reason = "🔴 SL"
-                    elif profit > self.cfg.trailing_min_profit:
-                        if profit > self.cfg.trailing_high_profit:
-                            dynamic_trailing = self.cfg.trailing_high_drop
-                        elif profit > self.cfg.trailing_mid_profit:
-                            dynamic_trailing = self.cfg.trailing_mid_drop
-                        else:
-                            dynamic_trailing = self.cfg.base_trailing
-
-                        if drop_from_max <= dynamic_trailing:
+                    else:
+                        # Hard exit from peak — zapobiega katastrofalnemu dumpowi
+                        drop_from_high = (pos["max_price"] - price) / pos["max_price"]
+                        if drop_from_high >= self.cfg.hard_exit_from_high:
                             exit_reason = "TS 📉"
+                        elif profit > self.cfg.trailing_min_profit:
+                            trail_distance = self._get_trail_distance(pos["entry"], price)
+                            trail_price = pos["max_price"] * (1 - trail_distance)
+                            if price <= trail_price:
+                                exit_reason = "TS 📉"
 
                     duration = now - pos["start"]
 
                     # Quick exit: pump failed within 2 minutes
                     if exit_reason is None and duration > self.cfg.quick_exit_seconds:
                         if raw_profit < self.cfg.quick_exit_threshold:
-                            exit_reason = "⏱ QUICK"
+                            current_loss_pct = (pos["entry"] - price) / pos["entry"]
+                            if current_loss_pct >= self.cfg.quick_exit_min_loss:
+                                exit_reason = "⏱ QUICK"
 
                     # Regular time exit
                     if exit_reason is None and duration > self.cfg.time_exit_seconds:
@@ -606,6 +659,16 @@ class PumpEngine:
 
                         del self.active_positions[symbol]
 
+                        # ── ML Analytics: rejestracja wyjścia ──
+                        _tid_pump = self._trade_ids.pop(symbol, None)
+                        if _tid_pump:
+                            self.analytics.on_exit(
+                                trade_id=_tid_pump,
+                                exit_reason=exit_reason,
+                                pnl=pnl_usd,
+                                pnl_pct=pnl_usd / pos['stake'] if pos['stake'] > 0 else 0,
+                            )
+
                         # Record last profitable exit price for anti-churn guard
                         if exit_reason == "TS 📉" and pnl_usd > 0:
                             self.ticker_memory[symbol]["last_good_exit_price"] = price
@@ -613,6 +676,9 @@ class PumpEngine:
                         # Cooldown by exit reason
                         if exit_reason == "🔴 SL":
                             self.cooldowns[symbol] = now + self.cfg.cooldown_after_sl
+                            self._sl_blocked_symbols[symbol] = (
+                                time.monotonic() + self.cfg.sl_reentry_block_seconds
+                            )
                         elif exit_reason == "TS 📉" and pnl_usd > 0:
                             self.cooldowns[symbol] = now + self.cfg.cooldown_seconds * 0.5
                         elif exit_reason in ("⏱ QUICK", "⏱ TIME"):

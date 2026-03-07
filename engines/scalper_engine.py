@@ -13,6 +13,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from config import ScalperConfig, EXCHANGE
 from market_data import MarketData
 from vault import TELEGRAM_SCALPER
+from analytics_engine import get_analytics
 
 
 def send_telegram(msg, token, chat_id):
@@ -50,6 +51,8 @@ class ScalperEngine:
         self.market_data = market_data
         self.tg = tg
         self.portfolio = portfolio
+        self.analytics = get_analytics('scalper')
+        self._trade_ids: dict = {}
         self.balance_usdt = self.cfg.start_balance
 
         # {symbol: position_dict}
@@ -313,6 +316,9 @@ class ScalperEngine:
             atr_ser = ta.atr(df1["h"], df1["l"], df1["c"], length=7)
             atr_val = float(atr_ser.iloc[-1])
             atr_pct = atr_val / price if price > 0 else 0.0
+            min_atr_for_profit = 0.005 / self.cfg.atr_sl_multiplier
+            if atr_pct < min_atr_for_profit:
+                return 0, None
             if 0.003 <= atr_pct <= 0.020:
                 score += 15
 
@@ -437,6 +443,15 @@ class ScalperEngine:
             tg_msg  += f" | {self._wr_text()}"
             gui_msg += f" | {self._wr_text()}"
             del self.active_positions[symbol]
+            # ── ML Analytics: rejestracja wyjścia ──
+            _tid = self._trade_ids.pop(symbol, None)
+            if _tid:
+                self.analytics.on_exit(
+                    trade_id=_tid,
+                    exit_reason=reason_label,
+                    pnl=pos['accumulated_pnl'],
+                    pnl_pct=pos['accumulated_pnl'] / pos['original_stake'],
+                )
             self.cooldowns[symbol] = time.monotonic() + self.cfg.cooldown_seconds
 
         self.gui_log(gui_msg)
@@ -474,8 +489,9 @@ class ScalperEngine:
             if wr < self.cfg.rolling_wr_min:
                 if self._pause_until <= now:
                     self._pause_until = now + self.cfg.rolling_wr_pause
+                    self._recent_trade_results = []
                     msg = (f"⛔ Rolling WR {wr*100:.0f}% < "
-                           f"{self.cfg.rolling_wr_min*100:.0f}% — pauza 2h")
+                           f"{self.cfg.rolling_wr_min*100:.0f}% — pauza 1h")
                     self.log(msg)
                     self.gui_log(msg)
                     await self._tg(msg)
@@ -500,6 +516,37 @@ class ScalperEngine:
 
         tp1_price        = price + self.cfg.tp1_r_multiple * sl_distance
         runner_activation = price + self.cfg.runner_activation_r * sl_distance
+
+        # ── ML Analytics: rejestracja wejścia ──
+        _features = {
+            'score':             score,
+            'vol_ratio':         features.get('vol_ratio', 0),
+            'body_ratio':        features.get('body_ratio', 0),
+            'atr_pct':           features.get('atr_pct', 0),
+            'upper_wick_ratio':  features.get('uw_ratio', 0),
+            'breakout_strength': features.get('breakout_strength', 1.0),
+            'ema9_slope':        0.0,
+            'ema21_slope':       0.0,
+            'ema_spread':        0.0,
+            'btc_trend':         1 if self._btc_regime_cache.get('result', True) else -1,
+            'btc_atr_pct':       0.0,
+            'btc_vol_ratio':     1.0,
+        }
+        _ml = self.analytics.on_entry(
+            symbol=symbol, entry_price=price, stake=stake,
+            sl_pct=sl_distance / price,
+            tp1_pct=(tp1_price - price) / price,
+            features=_features,
+        )
+        self._trade_ids[symbol] = _ml['trade_id']
+
+        # Blokady ML (sprawdź przed otwarciem pozycji)
+        _ml_blocked, _ml_reason = self.analytics.is_trading_blocked()
+        if _ml_blocked:
+            self.gui_log(f"🤖 {_ml_reason}")
+            return
+        if self.analytics.is_symbol_blocked(symbol):
+            return
 
         self.active_positions[symbol] = {
             "entry":             price,
