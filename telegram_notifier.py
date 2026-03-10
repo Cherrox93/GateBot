@@ -1,4 +1,4 @@
-# telegram_notifier.py
+﻿# telegram_notifier.py
 import asyncio
 import threading
 import time
@@ -72,22 +72,22 @@ class TelegramNotifier:
     #   Send
     # ============================
     def send_sync(self, text: str):
-        """Blocking send — use from sync/thread context."""
+        """Blocking send â€” use from sync/thread context."""
         self._post_sync("sendMessage", {
             "chat_id": int(self.chat_id),
             "text": text,
         })
 
     async def send(self, text: str):
-        """Non-blocking send — use from async context."""
+        """Non-blocking send â€” use from async context."""
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.send_sync, text)
 
     # ============================
-    #   Async polling (scalper / pump)
+    #   Async polling (scalper / grid_bot)
     # ============================
     async def start_polling_async(self, command_handler):
-        """Long-polling coroutine — run as asyncio.create_task."""
+        """Long-polling coroutine â€” run as asyncio.create_task."""
         self._running = True
         loop = asyncio.get_running_loop()
         while self._running:
@@ -111,7 +111,7 @@ class TelegramNotifier:
                 await asyncio.sleep(5)
 
     # ============================
-    #   Sync polling (lowcap — in daemon thread)
+    #   Sync polling (lowcap â€” in daemon thread)
     # ============================
     def start_polling_thread(self, command_handler):
         """Starts long-polling in a daemon thread. Returns thread."""
@@ -141,3 +141,4 @@ class TelegramNotifier:
 
     def stop_polling(self):
         self._running = False
+

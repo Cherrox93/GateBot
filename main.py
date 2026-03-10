@@ -1,9 +1,9 @@
-import sys
+﻿import sys
 import asyncio
 import threading
 from collections import deque
 
-# Wymagane na Windows: aiohttp (ccxt.async_support) nie działa z domyślnym ProactorEventLoop
+# Wymagane na Windows: aiohttp (ccxt.async_support) nie dziaÅ‚a z domyÅ›lnym ProactorEventLoop
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -14,13 +14,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat
 
-from config import ScalperConfig, LowcapConfig, PumpConfig
+from config import ScalperConfig, LowcapConfig, GridBotConfig
 from engines.scalper_engine import ScalperEngine
 from engines.lowcap_engine import LowcapEngine
-from engines.pump_engine import PumpEngine
+from engines.grid_bot_engine import GridBotEngine
 from market_data import MarketData
 from telegram_notifier import TelegramNotifier
-from vault import TELEGRAM_SCALPER, TELEGRAM_LOWCAP, TELEGRAM_PUMP
+from vault import TELEGRAM_SCALPER, TELEGRAM_LOWCAP, TELEGRAM_GRID_BOT
+from wallet import SharedWallet
 
 from datetime import datetime
 
@@ -31,21 +32,23 @@ class Controller:
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
 
-        # Jeden wspólny MarketData – pobiera wszystkie pary USDT automatycznie
+        # Jeden wspÃ³lny MarketData â€“ pobiera wszystkie pary USDT automatycznie
         self.market_data = MarketData()
+        self.wallet = SharedWallet(initial_usdt=200.0)
 
         # Telegram notifiers
         tg_scalper = TelegramNotifier(TELEGRAM_SCALPER.token, TELEGRAM_SCALPER.chat_id)
         tg_lowcap  = TelegramNotifier(TELEGRAM_LOWCAP.token,  TELEGRAM_LOWCAP.chat_id)
-        tg_pump    = TelegramNotifier(TELEGRAM_PUMP.token,    TELEGRAM_PUMP.chat_id)
+        tg_grid_bot    = TelegramNotifier(TELEGRAM_GRID_BOT.token,    TELEGRAM_GRID_BOT.chat_id)
 
 
-        # Boty dostają referencję do MarketData i Telegram
+        # Boty dostajÄ… referencjÄ™ do MarketData i Telegram
         self.scalper = ScalperEngine(
             ScalperConfig(),
             log_callback=None,
             market_data=self.market_data,
             tg=tg_scalper,
+            portfolio=self.wallet,
         )
 
         self.lowcap = LowcapEngine(
@@ -53,14 +56,19 @@ class Controller:
             log_callback=None,
             market_data=self.market_data,
             tg=tg_lowcap,
+            portfolio=self.wallet,
         )
 
-        self.pump = PumpEngine(
-            PumpConfig(),
+        self.grid_bot = GridBotEngine(
+            GridBotConfig(),
             log_callback=None,
             market_data=self.market_data,
-            tg=tg_pump,
+            tg=tg_grid_bot,
+            portfolio=self.wallet,
         )
+
+        # Uruchom MarketData od razu po starcie aplikacji
+        self.run_async(self.market_data.start())
 
     def run_async(self, coro):
         asyncio.run_coroutine_threadsafe(coro, self.loop)
@@ -92,16 +100,16 @@ class Controller:
             return False
 
     # ============================
-    #        TOGGLE PUMP
+    #        TOGGLE grid_bot
     # ============================
-    def toggle_pump(self):
-        if not self.pump.running:
+    def toggle_grid_bot(self):
+        if not self.grid_bot.running:
             if not self.market_data.running:
                 self.run_async(self.market_data.start())
-            self.run_async(self.pump.start())
+            self.run_async(self.grid_bot.start())
             return True
         else:
-            self.run_async(self.pump.stop())
+            self.run_async(self.grid_bot.stop())
             return False
 
 
@@ -110,17 +118,17 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.ctrl = ctrl
 
-        # bufory logów
+        # bufory logÃ³w
         self.scalper_log_buffer = deque()
         self.lowcap_log_buffer = deque()
-        self.pump_log_buffer = deque()
+        self.grid_bot_log_buffer = deque()
 
-        # callbacki – tu podpinamy GUI do botów
+        # callbacki â€“ tu podpinamy GUI do botÃ³w
         self.ctrl.scalper.log_callback = self.gui_log_scalper
         self.ctrl.lowcap.log_callback = self.gui_log_lowcap
-        self.ctrl.pump.log_callback = self.gui_log_pump
+        self.ctrl.grid_bot.log_callback = self.gui_log_grid_bot
 
-        self.setWindowTitle("GATEBOT – Silniki Tradingowe")
+        self.setWindowTitle("GATEBOT â€“ Silniki Tradingowe")
         self.resize(1300, 900)
 
         central = QWidget()
@@ -139,7 +147,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.scalper_btn, 0, 1)
         layout.addWidget(self.scalper_status, 0, 2)
 
-        self.lowcap_label = QLabel("Lowcap Scalper")
+        self.lowcap_label = QLabel("Micro-Reversion")
         self.lowcap_status = QLabel("not running")
         self.lowcap_status.setStyleSheet("color: red;")
         self.lowcap_btn = QPushButton("START")
@@ -149,15 +157,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lowcap_btn, 1, 1)
         layout.addWidget(self.lowcap_status, 1, 2)
 
-        self.pump_label = QLabel("Pump Detector")
-        self.pump_status = QLabel("not running")
-        self.pump_status.setStyleSheet("color: red;")
-        self.pump_btn = QPushButton("START")
-        self.pump_btn.clicked.connect(self.on_toggle_pump)
+        self.grid_bot_label = QLabel("Grid Bot")
+        self.grid_bot_status = QLabel("not running")
+        self.grid_bot_status.setStyleSheet("color: red;")
+        self.grid_bot_btn = QPushButton("START")
+        self.grid_bot_btn.clicked.connect(self.on_toggle_grid_bot)
 
-        layout.addWidget(self.pump_label, 2, 0)
-        layout.addWidget(self.pump_btn, 2, 1)
-        layout.addWidget(self.pump_status, 2, 2)
+        layout.addWidget(self.grid_bot_label, 2, 0)
+        layout.addWidget(self.grid_bot_btn, 2, 1)
+        layout.addWidget(self.grid_bot_status, 2, 2)
 
         # --- FRAME FOR LOGS ---
         self.logs_frame = QFrame()
@@ -170,14 +178,14 @@ class MainWindow(QMainWindow):
         # --- PROFIT LABELS ---
         self.scalper_profit_label = QLabel("0.00% | 0.00$")
         self.lowcap_profit_label = QLabel("0.00% | 0.00$")
-        self.pump_profit_label = QLabel("0.00% | 0.00$")
+        self.grid_bot_profit_label = QLabel("0.00% | 0.00$")
 
         # --- SCALPER LOG ---
-        self.scalper_title = QLabel("Highcap Scalper – log transakcji")
+        self.scalper_title = QLabel("Highcap Scalper â€“ log transakcji")
         frame_layout.addWidget(self.scalper_title, 0, 0)
         frame_layout.addWidget(self.scalper_profit_label, 0, 2, alignment=Qt.AlignmentFlag.AlignRight)
 
-        self.scalper_status_label = QLabel("🔍 Oczekiwanie…")
+        self.scalper_status_label = QLabel("ðŸ” Oczekiwanieâ€¦")
         frame_layout.addWidget(self.scalper_status_label, 1, 0, 1, 3)
 
         self.scalper_box = QTextEdit()
@@ -185,28 +193,28 @@ class MainWindow(QMainWindow):
         frame_layout.addWidget(self.scalper_box, 2, 0, 1, 3)
 
         # --- LOWCAP LOG ---
-        self.lowcap_title = QLabel("Lowcap Scalper – log transakcji")
+        self.lowcap_title = QLabel("Micro-Reversion â€“ log transakcji")
         frame_layout.addWidget(self.lowcap_title, 3, 0)
         frame_layout.addWidget(self.lowcap_profit_label, 3, 2, alignment=Qt.AlignmentFlag.AlignRight)
 
-        self.lowcap_status_label = QLabel("🔍 Oczekiwanie…")
+        self.lowcap_status_label = QLabel("ðŸ” Oczekiwanieâ€¦")
         frame_layout.addWidget(self.lowcap_status_label, 4, 0, 1, 3)
 
         self.lowcap_box = QTextEdit()
         self.lowcap_box.setReadOnly(True)
         frame_layout.addWidget(self.lowcap_box, 5, 0, 1, 3)
 
-        # --- PUMP LOG ---
-        self.pump_title = QLabel("Pump Detector – log transakcji")
-        frame_layout.addWidget(self.pump_title, 6, 0)
-        frame_layout.addWidget(self.pump_profit_label, 6, 2, alignment=Qt.AlignmentFlag.AlignRight)
+        # --- grid_bot LOG ---
+        self.grid_bot_title = QLabel("Grid Bot â€“ log transakcji")
+        frame_layout.addWidget(self.grid_bot_title, 6, 0)
+        frame_layout.addWidget(self.grid_bot_profit_label, 6, 2, alignment=Qt.AlignmentFlag.AlignRight)
 
-        self.pump_status_label = QLabel("🔍 Oczekiwanie…")
-        frame_layout.addWidget(self.pump_status_label, 7, 0, 1, 3)
+        self.grid_bot_status_label = QLabel("ðŸ” Oczekiwanieâ€¦")
+        frame_layout.addWidget(self.grid_bot_status_label, 7, 0, 1, 3)
 
-        self.pump_box = QTextEdit()
-        self.pump_box.setReadOnly(True)
-        frame_layout.addWidget(self.pump_box, 8, 0, 1, 3)
+        self.grid_bot_box = QTextEdit()
+        self.grid_bot_box.setReadOnly(True)
+        frame_layout.addWidget(self.grid_bot_box, 8, 0, 1, 3)
 
         layout.setColumnStretch(0, 2)
         layout.setRowStretch(3, 1)
@@ -230,17 +238,17 @@ class MainWindow(QMainWindow):
         else:
             self.lowcap_log_buffer.append(msg)
 
-    def gui_log_pump(self, msg: str):
+    def gui_log_grid_bot(self, msg: str):
         if msg.startswith("STATUS_UPDATE::"):
-            self.pump_status_label.setText(msg.replace("STATUS_UPDATE::", ""))
+            self.grid_bot_status_label.setText(msg.replace("STATUS_UPDATE::", ""))
         else:
-            self.pump_log_buffer.append(msg)
+            self.grid_bot_log_buffer.append(msg)
 
-    # --- FLUSH LOGÓW ---
+    # --- FLUSH LOGÃ“W ---
     def flush_logs(self):
         self._flush_buffer_to_widget(self.scalper_log_buffer, self.scalper_box)
         self._flush_buffer_to_widget(self.lowcap_log_buffer, self.lowcap_box)
-        self._flush_buffer_to_widget(self.pump_log_buffer, self.pump_box)
+        self._flush_buffer_to_widget(self.grid_bot_log_buffer, self.grid_bot_box)
 
     def _flush_buffer_to_widget(self, buffer: deque, widget: QTextEdit):
         if not buffer:
@@ -249,7 +257,7 @@ class MainWindow(QMainWindow):
         scrollbar = widget.verticalScrollBar()
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 20
 
-        # Insert via document cursor — does not move the widget's visible cursor/scroll
+        # Insert via document cursor â€” does not move the widget's visible cursor/scroll
         cursor = QTextCursor(widget.document())
 
         max_logs = 10
@@ -267,9 +275,9 @@ class MainWindow(QMainWindow):
             cursor.movePosition(QTextCursor.MoveOperation.End)
 
             fmt = QTextCharFormat()
-            if msg.startswith("✅"):
+            if msg.startswith("âœ…"):
                 fmt.setForeground(QColor("green"))
-            elif msg.startswith("❌"):
+            elif msg.startswith("âŒ"):
                 fmt.setForeground(QColor("red"))
             else:
                 fmt.setForeground(QColor("white"))
@@ -296,10 +304,10 @@ class MainWindow(QMainWindow):
         self.lowcap_profit_label.setText(f"{pct:.2f}% | {total:.2f}$")
         self.lowcap_profit_label.setStyleSheet("color: green;" if total >= 0 else "color: red;")
 
-        total = getattr(self.ctrl.pump, "realized_profit", 0.0)
-        pct = (total / self.ctrl.pump.cfg.start_balance) * 100 if total != 0 else 0
-        self.pump_profit_label.setText(f"{pct:.2f}% | {total:.2f}$")
-        self.pump_profit_label.setStyleSheet("color: green;" if total >= 0 else "color: red;")
+        total = getattr(self.ctrl.grid_bot, "realized_profit", 0.0)
+        pct = (total / self.ctrl.grid_bot.cfg.start_balance) * 100 if total != 0 else 0
+        self.grid_bot_profit_label.setText(f"{pct:.2f}% | {total:.2f}$")
+        self.grid_bot_profit_label.setStyleSheet("color: green;" if total >= 0 else "color: red;")
 
     # --- BUTTONY ---
     def on_toggle_scalper(self):
@@ -314,29 +322,29 @@ class MainWindow(QMainWindow):
         self.lowcap_status.setText("running" if running else "not running")
         self.lowcap_status.setStyleSheet("color: green;" if running else "color: red;")
 
-    def on_toggle_pump(self):
-        running = self.ctrl.toggle_pump()
-        self.pump_btn.setText("STOP" if running else "START")
-        self.pump_status.setText("running" if running else "not running")
-        self.pump_status.setStyleSheet("color: green;" if running else "color: red;")
+    def on_toggle_grid_bot(self):
+        running = self.ctrl.toggle_grid_bot()
+        self.grid_bot_btn.setText("STOP" if running else "START")
+        self.grid_bot_status.setText("running" if running else "not running")
+        self.grid_bot_status.setStyleSheet("color: green;" if running else "color: red;")
 
-    # --- ZAMKNIĘCIE ---
+    # --- ZAMKNIÄ˜CIE ---
     def closeEvent(self, event):
-        # Stop timer first — prevents flush_logs firing on destroyed widgets
+        # Stop timer first â€” prevents flush_logs firing on destroyed widgets
         self.timer.stop()
 
         # Disconnect log callbacks so daemon threads don't touch dead Qt objects
         self.ctrl.scalper.log_callback = None
         self.ctrl.lowcap.log_callback = None
-        self.ctrl.pump.log_callback = None
+        self.ctrl.grid_bot.log_callback = None
 
-        # Stop engines (best-effort — daemon threads die with the process anyway)
+        # Stop engines (best-effort â€” daemon threads die with the process anyway)
         if self.ctrl.scalper.running:
             self.ctrl.run_async(self.ctrl.scalper.stop())
         if self.ctrl.lowcap.running:
             self.ctrl.lowcap.stop()
-        if self.ctrl.pump.running:
-            self.ctrl.run_async(self.ctrl.pump.stop())
+        if self.ctrl.grid_bot.running:
+            self.ctrl.run_async(self.ctrl.grid_bot.stop())
         if self.ctrl.market_data.running:
             self.ctrl.run_async(self.ctrl.market_data.stop())
 
@@ -352,3 +360,5 @@ if __name__ == "__main__":
         sys.exit(app.exec())
     except KeyboardInterrupt:
         pass
+
+

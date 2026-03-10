@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="pl">
 <head>
 <meta charset="UTF-8">
@@ -202,7 +202,7 @@
   }
   .bot-card.scalper::before { background: linear-gradient(90deg, transparent, var(--neon-b), transparent); }
   .bot-card.lowcap::before  { background: linear-gradient(90deg, transparent, var(--neon-g), transparent); }
-  .bot-card.pump::before    { background: linear-gradient(90deg, transparent, var(--neon-y), transparent); }
+  .bot-card.grid_bot::before    { background: linear-gradient(90deg, transparent, var(--neon-y), transparent); }
 
   .bot-header {
     display: flex; align-items: center; justify-content: space-between;
@@ -234,7 +234,7 @@
   }
   .scalper .bot-name { color: var(--neon-b); }
   .lowcap  .bot-name { color: var(--neon-g); }
-  .pump    .bot-name { color: var(--neon-y); }
+  .grid_bot    .bot-name { color: var(--neon-y); }
 
   .bot-controls { display: flex; gap: 10px; align-items: center; }
 
@@ -405,13 +405,13 @@
   }
   .settings-card.scalper::before { background: linear-gradient(90deg, transparent, var(--neon-b), transparent); }
   .settings-card.lowcap::before  { background: linear-gradient(90deg, transparent, var(--neon-g), transparent); }
-  .settings-card.pump::before    { background: linear-gradient(90deg, transparent, var(--neon-y), transparent); }
+  .settings-card.grid_bot::before    { background: linear-gradient(90deg, transparent, var(--neon-y), transparent); }
   .settings-title {
     font-size: 13px; font-weight: 700; letter-spacing: 2px; margin-bottom: 18px;
   }
   .settings-card.scalper .settings-title { color: var(--neon-b); }
   .settings-card.lowcap  .settings-title { color: var(--neon-g); }
-  .settings-card.pump    .settings-title { color: var(--neon-y); }
+  .settings-card.grid_bot    .settings-title { color: var(--neon-y); }
   .settings-field { margin-bottom: 14px; }
   .settings-field label {
     display: block; font-size: 10px; letter-spacing: 2px;
@@ -520,19 +520,19 @@
       </div>
       <div class="overview-grid">
         <div class="ov-card c1">
-          <div class="ov-label">HIGHCAP SCALPER — PnL</div>
+          <div class="ov-label">SCALPER — PnL</div>
           <div class="ov-value" id="ov-scalper-pnl">0.00$</div>
           <div style="font-size:12px;color:var(--text-dim);margin-top:6px;font-family:var(--font-mono)" id="ov-scalper-wr">W:0 L:0 WR:0%</div>
         </div>
         <div class="ov-card c2">
-          <div class="ov-label">LOWCAP SCALPER — PnL</div>
+          <div class="ov-label">MICRO-REVERSION — PnL</div>
           <div class="ov-value" id="ov-lowcap-pnl">0.00$</div>
           <div style="font-size:12px;color:var(--text-dim);margin-top:6px;font-family:var(--font-mono)" id="ov-lowcap-wr">W:0 L:0 WR:0%</div>
         </div>
         <div class="ov-card c3">
-          <div class="ov-label">PUMP DETECTOR — PnL</div>
-          <div class="ov-value" id="ov-pump-pnl">0.00$</div>
-          <div style="font-size:12px;color:var(--text-dim);margin-top:6px;font-family:var(--font-mono)" id="ov-pump-wr">W:0 L:0 WR:0%</div>
+          <div class="ov-label">GRID BOT — PnL</div>
+          <div class="ov-value" id="ov-grid_bot-pnl">0.00$</div>
+          <div style="font-size:12px;color:var(--text-dim);margin-top:6px;font-family:var(--font-mono)" id="ov-grid_bot-wr">W:0 L:0 WR:0%</div>
         </div>
       </div>
       <div style="background:var(--bg2);border:1px solid var(--border);padding:20px;">
@@ -549,7 +549,7 @@
         <div class="bot-header">
           <div class="bot-title">
             <div class="bot-dot" id="dot-scalper"></div>
-            <div class="bot-name">HIGHCAP SCALPER</div>
+            <div class="bot-name">SCALPER</div>
           </div>
           <div class="bot-controls">
             <button class="btn-start" id="btn-start-scalper" onclick="startBot('scalper')">▶ START</button>
@@ -564,9 +564,11 @@
         </div>
         <div class="bot-body">
           <div class="log-panel" id="log-scalper"></div>
-          <div class="chart-panel">
-            <div class="chart-label">PnL SCALPER</div>
-            <canvas id="chart-scalper"></canvas>
+          <div class="chart-panel" id="scalper-positions-panel" style="display:flex;flex-direction:column;gap:6px;padding:10px;overflow-y:auto">
+            <div class="chart-label">OTWARTE POZYCJE</div>
+            <div id="scalper-live-positions" style="font-family:var(--font-mono);font-size:12px;color:var(--text-dim)">
+              Brak otwartych pozycji
+            </div>
           </div>
         </div>
         <div class="status-bar" id="status-scalper">🔍 Oczekiwanie…</div>
@@ -577,7 +579,7 @@
         <div class="bot-header">
           <div class="bot-title">
             <div class="bot-dot" id="dot-lowcap"></div>
-            <div class="bot-name">LOWCAP SCALPER</div>
+            <div class="bot-name">MICRO-REVERSION</div>
           </div>
           <div class="bot-controls">
             <button class="btn-start" id="btn-start-lowcap" onclick="startBot('lowcap')">▶ START</button>
@@ -593,39 +595,39 @@
         <div class="bot-body">
           <div class="log-panel" id="log-lowcap"></div>
           <div class="chart-panel">
-            <div class="chart-label">PnL LOWCAP</div>
+            <div class="chart-label">PnL MICRO-REVERSION</div>
             <canvas id="chart-lowcap"></canvas>
           </div>
         </div>
         <div class="status-bar" id="status-lowcap">🔍 Oczekiwanie…</div>
       </div>
 
-      <!-- PUMP -->
-      <div class="bot-card pump">
+      <!-- grid_bot -->
+      <div class="bot-card grid_bot">
         <div class="bot-header">
           <div class="bot-title">
-            <div class="bot-dot" id="dot-pump"></div>
-            <div class="bot-name">PUMP DETECTOR</div>
+            <div class="bot-dot" id="dot-grid_bot"></div>
+            <div class="bot-name">GRID BOT</div>
           </div>
           <div class="bot-controls">
-            <button class="btn-start" id="btn-start-pump" onclick="startBot('pump')">▶ START</button>
-            <button class="btn-stop"  id="btn-stop-pump"  onclick="stopBot('pump')" disabled>■ STOP</button>
+            <button class="btn-start" id="btn-start-grid_bot" onclick="startBot('grid_bot')">▶ START</button>
+            <button class="btn-stop"  id="btn-stop-grid_bot"  onclick="stopBot('grid_bot')" disabled>■ STOP</button>
           </div>
         </div>
         <div class="stats-row">
-          <div class="stat-item"><div class="stat-label">ZYSK / STRATA</div><div class="stat-value neu" id="stat-pump-pnl">0.00$</div></div>
-          <div class="stat-item"><div class="stat-label">WIN RATE</div><div class="stat-value neu" id="stat-pump-wr">0%</div></div>
-          <div class="stat-item"><div class="stat-label">WYGRANE</div><div class="stat-value pos" id="stat-pump-w">0</div></div>
-          <div class="stat-item"><div class="stat-label">PRZEGRANE</div><div class="stat-value neg" id="stat-pump-l">0</div></div>
+          <div class="stat-item"><div class="stat-label">ZYSK / STRATA</div><div class="stat-value neu" id="stat-grid_bot-pnl">0.00$</div></div>
+          <div class="stat-item"><div class="stat-label">WIN RATE</div><div class="stat-value neu" id="stat-grid_bot-wr">0%</div></div>
+          <div class="stat-item"><div class="stat-label">WYGRANE</div><div class="stat-value pos" id="stat-grid_bot-w">0</div></div>
+          <div class="stat-item"><div class="stat-label">PRZEGRANE</div><div class="stat-value neg" id="stat-grid_bot-l">0</div></div>
         </div>
         <div class="bot-body">
-          <div class="log-panel" id="log-pump"></div>
+          <div class="log-panel" id="log-grid_bot"></div>
           <div class="chart-panel">
-            <div class="chart-label">PnL PUMP</div>
-            <canvas id="chart-pump"></canvas>
+            <div class="chart-label">PnL GRID</div>
+            <canvas id="chart-grid_bot"></canvas>
           </div>
         </div>
-        <div class="status-bar" id="status-pump">🔍 Oczekiwanie…</div>
+        <div class="status-bar" id="status-grid_bot">🔍 Oczekiwanie…</div>
       </div>
 
     </div>
@@ -634,16 +636,16 @@
     <div class="tab-panel" id="tab-wykresy">
       <div class="charts-grid">
         <div class="chart-card">
-          <div class="chart-card-title">PnL — HIGHCAP SCALPER</div>
+          <div class="chart-card-title">PnL — SCALPER</div>
           <canvas id="chart-scalper-big"></canvas>
         </div>
         <div class="chart-card">
-          <div class="chart-card-title">PnL — LOWCAP SCALPER</div>
+          <div class="chart-card-title">PnL — MICRO-REVERSION</div>
           <canvas id="chart-lowcap-big"></canvas>
         </div>
         <div class="chart-card">
-          <div class="chart-card-title">PnL — PUMP DETECTOR</div>
-          <canvas id="chart-pump-big"></canvas>
+          <div class="chart-card-title">PnL — GRID BOT</div>
+          <canvas id="chart-grid_bot-big"></canvas>
         </div>
         <div class="chart-card">
           <div class="chart-card-title">WIN RATE — WSZYSTKIE BOTY</div>
@@ -664,8 +666,10 @@
     <div class="tab-panel" id="tab-ustawienia">
       <div style="margin-bottom:16px;font-size:12px;letter-spacing:2px;color:var(--text-dim)">USTAWIENIA BOTÓW</div>
       <div class="settings-grid">
-        <div class="settings-card scalper">
-          <div class="settings-title">HIGHCAP SCALPER</div>
+        <div class="settings-card scalper" style="max-height:620px;overflow-y:auto">
+          <div class="settings-title">SCALPER</div>
+
+          <div style="color:#555;font-size:10px;letter-spacing:1px;margin:8px 0 4px;border-bottom:1px solid #222;padding-bottom:3px">KAPITAL</div>
           <div class="settings-field">
             <label>STAWKA (USD)</label>
             <input type="number" id="cfg-scalper-stake" step="1" min="1">
@@ -674,34 +678,127 @@
             <label>MAKS. SLOTY</label>
             <input type="number" id="cfg-scalper-slots" step="1" min="1" max="10">
           </div>
+          <div class="settings-field">
+            <label>MAKER FEE %</label>
+            <input type="number" id="cfg-scalper-fee" step="0.001" min="0">
+          </div>
+
+          <div style="color:#555;font-size:10px;letter-spacing:1px;margin:8px 0 4px;border-bottom:1px solid #222;padding-bottom:3px">RYZYKO</div>
+          <div class="settings-field">
+            <label>TAKE PROFIT %</label>
+            <input type="number" id="cfg-scalper-tp" step="0.01" min="0.01" max="10">
+          </div>
+          <div class="settings-field">
+            <label>STOP LOSS %</label>
+            <input type="number" id="cfg-scalper-sl" step="0.01" min="0.01" max="10">
+          </div>
+          <div class="settings-field">
+            <label>TRAILING STOP %</label>
+            <input type="number" id="cfg-scalper-trail" step="0.01" min="0" max="10">
+          </div>
+          <div class="settings-field">
+            <label>DZIENNY LIMIT STRAT %</label>
+            <input type="number" id="cfg-scalper-daily-loss" step="0.1" min="0.1" max="50">
+          </div>
+          <div class="settings-field">
+            <label>MAKS. CZAS POZYCJI (s)</label>
+            <input type="number" id="cfg-scalper-max-time" step="1" min="1">
+          </div>
+          <div class="settings-field">
+            <label>MAKS. TRANSAKCJI/DZIEN</label>
+            <input type="number" id="cfg-scalper-max-trades" step="1" min="1">
+          </div>
+
+          <div style="color:#555;font-size:10px;letter-spacing:1px;margin:8px 0 4px;border-bottom:1px solid #222;padding-bottom:3px">SYGNALY</div>
+          <div class="settings-field">
+            <label>MIN. SILA SYGNALU</label>
+            <input type="number" id="cfg-scalper-strength" step="0.01" min="0" max="1">
+          </div>
+          <div class="settings-field">
+            <label>COOLDOWN SYMBOLU (s)</label>
+            <input type="number" id="cfg-scalper-cooldown" step="0.1" min="0">
+          </div>
+          <div class="settings-field">
+            <label>MIN. MOMENTUM %</label>
+            <input type="number" id="cfg-scalper-momentum" step="0.01" min="0">
+          </div>
+          <div class="settings-field">
+            <label>MNOZNIK WOLUMENU</label>
+            <input type="number" id="cfg-scalper-vol-mult" step="0.1" min="0.1">
+          </div>
+          <div class="settings-field">
+            <label>MIN. ATR %</label>
+            <input type="number" id="cfg-scalper-atr" step="0.01" min="0">
+          </div>
+
+          <div style="color:#555;font-size:10px;letter-spacing:1px;margin:8px 0 4px;border-bottom:1px solid #222;padding-bottom:3px">PULLBACK</div>
+          <div class="settings-field">
+            <label>MIN. RETRACE %</label>
+            <input type="number" id="cfg-scalper-pb-min" step="1" min="0" max="100">
+          </div>
+          <div class="settings-field">
+            <label>MAX. RETRACE %</label>
+            <input type="number" id="cfg-scalper-pb-max" step="1" min="0" max="100">
+          </div>
+          <div class="settings-field">
+            <label>IMPULSE TTL (s)</label>
+            <input type="number" id="cfg-scalper-impulse-ttl" step="1" min="1">
+          </div>
+
+          <div style="color:#555;font-size:10px;letter-spacing:1px;margin:8px 0 4px;border-bottom:1px solid #222;padding-bottom:3px">TREND</div>
+          <div class="settings-field">
+            <label>OKNO MOMENTUM (s)</label>
+            <input type="number" id="cfg-scalper-mom-window" step="0.5" min="0.5">
+          </div>
+          <div class="settings-field">
+            <label>OKNO WOLUMENU BAZ. (s)</label>
+            <input type="number" id="cfg-scalper-vol-window" step="1" min="1">
+          </div>
+          <div class="settings-field">
+            <label>TREND EMA OKRES</label>
+            <input type="number" id="cfg-scalper-trend-ema" step="1" min="2">
+          </div>
+          <div class="settings-field">
+            <label>TREND OKNO (s)</label>
+            <input type="number" id="cfg-scalper-trend-window" step="1" min="1">
+          </div>
+
           <button class="btn-save" onclick="saveSetting('scalper')">ZAPISZ</button>
           <div class="save-feedback" id="fb-scalper"></div>
         </div>
         <div class="settings-card lowcap">
-          <div class="settings-title">LOWCAP SCALPER</div>
+          <div class="settings-title">MICRO-REVERSION</div>
           <div class="settings-field">
-            <label>STAWKA (USD)</label>
+            <label>KAPITAŁ NA PARĘ (USD)</label>
             <input type="number" id="cfg-lowcap-stake" step="1" min="1">
           </div>
           <div class="settings-field">
-            <label>MAKS. SLOTY</label>
+            <label>LICZBA PAR</label>
             <input type="number" id="cfg-lowcap-slots" step="1" min="1" max="10">
+          </div>
+          <div class="settings-field">
+            <label>LICZBA GRID DLA PARY</label>
+            <input type="number" id="cfg-lowcap-orders" step="1" min="1" max="5">
           </div>
           <button class="btn-save" onclick="saveSetting('lowcap')">ZAPISZ</button>
           <div class="save-feedback" id="fb-lowcap"></div>
         </div>
-        <div class="settings-card pump">
-          <div class="settings-title">PUMP DETECTOR</div>
+        <div class="settings-card grid_bot">
+          <div class="settings-title">GRID BOT</div>
           <div class="settings-field">
-            <label>STAWKA (USD)</label>
-            <input type="number" id="cfg-pump-stake" step="1" min="1">
+            <label>Stake Per Grid</label>
+            <input type="number" id="cfg-grid_bot-stake" step="1" min="1">
           </div>
           <div class="settings-field">
-            <label>MAKS. SLOTY</label>
-            <input type="number" id="cfg-pump-slots" step="1" min="1" max="10">
+            <label>Max Orders Per Pair</label>
+            <input type="number" id="cfg-grid_bot-slots" step="1" min="1" max="10">
           </div>
-          <button class="btn-save" onclick="saveSetting('pump')">ZAPISZ</button>
-          <div class="save-feedback" id="fb-pump"></div>
+          <div class="settings-field">
+            <label>Pairs</label>
+            <input type="number" id="cfg-grid_bot-pairs" step="1" min="1" max="10">
+          </div>
+          <button class="btn-save" onclick="saveSetting('grid_bot')">ZAPISZ</button>
+          <div class="save-feedback" id="fb-grid_bot"></div>
         </div>
       </div>
     </div>
@@ -730,9 +827,9 @@
         <select id="analytics-bot-select" onchange="loadAnalytics()"
           style="background:#1a1a2e;color:#fff;border:1px solid #333;
                  padding:6px 12px;border-radius:6px;cursor:pointer">
-          <option value="scalper">🔵 Highcap Scalper</option>
-          <option value="lowcap">🟢 Lowcap Scalper</option>
-          <option value="pump">🟡 Pump Detector</option>
+          <option value="scalper">🔵 Scalper</option>
+          <option value="lowcap">🟢 Micro-Reversion</option>
+          <option value="grid_bot">🟡 Grid Bot</option>
         </select>
       </div>
 
@@ -779,7 +876,7 @@
 let TOKEN = localStorage.getItem('gatebot_token') || '';
 let ws = null;
 const charts = {};
-const pnlData = { scalper: [], lowcap: [], pump: [] };
+const pnlData = { scalper: [], lowcap: [], grid_bot: [] };
 const allTrades = [];
 
 // ═══════════════════════════════
@@ -845,7 +942,7 @@ function showApp() {
 }
 
 async function loadLogs() {
-  for (const bot of ['scalper', 'lowcap', 'pump']) {
+  for (const bot of ['scalper', 'lowcap', 'grid_bot']) {
     try {
       const logs = await apiFetch(`/api/logs/${bot}`);
       if (!Array.isArray(logs)) continue;
@@ -905,7 +1002,7 @@ async function loadState() {
   mp.textContent = data.market_data_running ? 'MARKET DATA: ON' : 'MARKET DATA: OFF';
   mp.className = 'market-pill ' + (data.market_data_running ? 'on' : 'off');
 
-  ['scalper','lowcap','pump'].forEach(bot => {
+  ['scalper','lowcap','grid_bot'].forEach(bot => {
     const b = data[bot];
     updateBotUI(bot, b);
   });
@@ -958,6 +1055,26 @@ function updateBotUI(bot, b) {
 
   // Positions
   renderPositions(b.open_positions || [], bot);
+
+  // Initialize scalper live positions from state (entry/sl/tp, no live price yet)
+  if (bot === 'scalper' && b.position_details) {
+    Object.entries(b.position_details).forEach(([sym, d]) => {
+      if (!scalperLivePositions[sym]) {
+        scalperLivePositions[sym] = {
+          entry_price: d.entry_price || 0,
+          current_price: d.entry_price || 0,
+          sl_price: d.sl_price || 0,
+          tp_price: d.tp_price || 0,
+        };
+      }
+    });
+    // Remove positions no longer open
+    const openSyms = new Set(Object.keys(b.position_details));
+    Object.keys(scalperLivePositions).forEach(sym => {
+      if (!openSyms.has(sym)) delete scalperLivePositions[sym];
+    });
+    renderScalperLivePositions();
+  }
 }
 
 // ═══════════════════════════════
@@ -976,6 +1093,9 @@ function connectWS() {
       dot.className = 'bot-dot' + (msg.running ? ' running' : '');
       document.getElementById(`btn-start-${msg.bot}`).disabled = msg.running;
       document.getElementById(`btn-stop-${msg.bot}`).disabled  = !msg.running;
+    }
+    if (msg.type === 'position_update' && msg.bot === 'scalper') {
+      handleScalperPositionUpdate(msg);
     }
   };
 
@@ -1085,10 +1205,10 @@ function makeLineChart(id, color) {
 function initCharts() {
   charts.scalper     = makeLineChart('chart-scalper',     '#00cfff');
   charts.lowcap      = makeLineChart('chart-lowcap',      '#00ff88');
-  charts.pump        = makeLineChart('chart-pump',        '#ffe000');
+  charts.grid_bot        = makeLineChart('chart-grid_bot',        '#ffe000');
   charts.scalperBig  = makeLineChart('chart-scalper-big', '#00cfff');
   charts.lowcapBig   = makeLineChart('chart-lowcap-big',  '#00ff88');
-  charts.pumpBig     = makeLineChart('chart-pump-big',    '#ffe000');
+  charts.grid_botBig = makeLineChart('chart-grid_bot-big',    '#ffe000');
   charts.totalPnl    = makeLineChart('chart-total-pnl',   '#00cfff');
 
   // Win rate donut
@@ -1130,7 +1250,7 @@ function updateChart(bot, history) {
 }
 
 function updateTotalChart() {
-  const allPoints = [...pnlData.scalper, ...pnlData.lowcap, ...pnlData.pump]
+  const allPoints = [...pnlData.scalper, ...pnlData.lowcap, ...pnlData.grid_bot]
     .sort((a,b) => a.ts - b.ts);
 
   let total = 0;
@@ -1162,7 +1282,7 @@ function updateWRDonut() {
 function renderHistory() {
   const tbody = document.getElementById('trade-history');
   tbody.innerHTML = allTrades.slice(0,100).map(t => {
-    const botColor = {scalper:'#00cfff', lowcap:'#00ff88', pump:'#ffe000'}[t.bot] || '#ffffff';
+    const botColor = {scalper:'#00cfff', lowcap:'#00ff88', grid_bot:'#ffe000'}[t.bot] || '#ffffff';
     return `
     <tr>
       <td style="color:var(--text-dim)">${t.ts}</td>
@@ -1190,13 +1310,73 @@ function renderPositions(symbols, bot) {
     grid.innerHTML = '<div style="color:var(--text-dim);font-family:var(--font-mono);font-size:13px">Brak otwartych pozycji</div>';
     return;
   }
-  const colors = {scalper:'var(--neon-b)', lowcap:'var(--neon-g)', pump:'var(--neon-y)'};
+  const colors = {scalper:'var(--neon-b)', lowcap:'var(--neon-g)', grid_bot:'var(--neon-y)'};
+  const labels = {scalper:'SCALPER', lowcap:'MICRO-REVERSION', grid_bot:'GRID BOT'};
   grid.innerHTML = all.map(p => `
     <div class="pos-card">
       <div class="pos-sym" style="color:${colors[p.bot]||'var(--text)'}">${p.sym}</div>
-      <div class="pos-detail">Bot: ${p.bot.toUpperCase()}</div>
+      <div class="pos-detail">Bot: ${labels[p.bot] || p.bot.toUpperCase()}</div>
     </div>
   `).join('');
+}
+
+// ═══════════════════════════════
+//   SCALPER LIVE POSITIONS
+// ═══════════════════════════════
+const scalperLivePositions = {};
+
+function handleScalperPositionUpdate(msg) {
+  const sym = msg.symbol;
+  if (msg.closed) {
+    delete scalperLivePositions[sym];
+  } else {
+    scalperLivePositions[sym] = {
+      entry_price: msg.entry_price,
+      current_price: msg.current_price,
+      sl_price: msg.sl_price,
+      tp_price: msg.tp_price,
+    };
+  }
+  renderScalperLivePositions();
+}
+
+function renderScalperLivePositions() {
+  const container = document.getElementById('scalper-live-positions');
+  if (!container) return;
+  const entries = Object.entries(scalperLivePositions);
+  if (!entries.length) {
+    container.innerHTML = '<div style="color:var(--text-dim)">Brak otwartych pozycji</div>';
+    return;
+  }
+  container.innerHTML = entries.map(([sym, p]) => {
+    const aboveEntry = p.current_price >= p.entry_price;
+    const priceColor = aboveEntry ? '#00ff88' : '#ff4444';
+    const pnlPct = ((p.current_price / p.entry_price - 1) * 100).toFixed(3);
+    const pnlSign = pnlPct >= 0 ? '+' : '';
+    return `
+      <div style="background:#0d0d1a;border:1px solid ${priceColor}33;border-radius:6px;padding:8px 10px;margin-bottom:4px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <span style="color:var(--neon-b);font-weight:bold;font-size:13px">${sym}</span>
+          <span style="color:${priceColor};font-size:11px;font-weight:bold">${pnlSign}${pnlPct}%</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:11px">
+          <span style="color:#888">Actual:</span>
+          <span style="color:${priceColor};font-weight:bold">${p.current_price.toFixed(6)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:11px">
+          <span style="color:#888">Entry:</span>
+          <span style="color:#ccc">${p.entry_price.toFixed(6)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:11px">
+          <span style="color:#888">SL:</span>
+          <span style="color:#ff4444">${p.sl_price.toFixed(6)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:11px">
+          <span style="color:#888">TP:</span>
+          <span style="color:#00ff88">${p.tp_price.toFixed(6)}</span>
+        </div>
+      </div>`;
+  }).join('');
 }
 
 // ═══════════════════════════════
@@ -1225,25 +1405,87 @@ async function fetchPortfolio() {
 // ═══════════════════════════════
 //   SETTINGS
 // ═══════════════════════════════
+// Scalper field definitions: {id, key, pct (show as %), int}
+const SCALPER_FIELDS = [
+  {id:'cfg-scalper-tp',           key:'target_profit_pct',       pct:true},
+  {id:'cfg-scalper-sl',           key:'stop_loss_pct',           pct:true},
+  {id:'cfg-scalper-trail',        key:'trailing_stop_pct',       pct:true},
+  {id:'cfg-scalper-fee',          key:'maker_fee',               pct:true},
+  {id:'cfg-scalper-daily-loss',   key:'daily_loss_limit_pct',    pct:true},
+  {id:'cfg-scalper-momentum',     key:'momentum_min_change',     pct:true},
+  {id:'cfg-scalper-atr',          key:'atr_filter_min',          pct:true},
+  {id:'cfg-scalper-pb-min',       key:'pullback_min_retrace',    pct:true},
+  {id:'cfg-scalper-pb-max',       key:'pullback_max_retrace',    pct:true},
+  {id:'cfg-scalper-max-trades',   key:'max_trades_day',          int:true},
+  {id:'cfg-scalper-max-time',     key:'max_position_time_sec'},
+  {id:'cfg-scalper-strength',     key:'min_signal_strength'},
+  {id:'cfg-scalper-cooldown',     key:'symbol_cooldown_sec'},
+  {id:'cfg-scalper-vol-mult',     key:'volume_spike_mult'},
+  {id:'cfg-scalper-impulse-ttl',  key:'impulse_ttl_sec'},
+  {id:'cfg-scalper-mom-window',   key:'momentum_window_sec'},
+  {id:'cfg-scalper-vol-window',   key:'volume_baseline_window_sec'},
+  {id:'cfg-scalper-trend-ema',    key:'trend_ema_period',        int:true},
+  {id:'cfg-scalper-trend-window', key:'trend_window_sec'},
+];
+
 async function loadSettings() {
   const data = await apiFetch('/api/settings');
   if (!data) return;
-  ['scalper','lowcap','pump'].forEach(bot => {
+  ['scalper','lowcap','grid_bot'].forEach(bot => {
     const s = data[bot];
     if (!s) return;
-    document.getElementById(`cfg-${bot}-stake`).value = s.stake_usd;
-    document.getElementById(`cfg-${bot}-slots`).value = s.max_slots;
+    const stakeEl = document.getElementById(`cfg-${bot}-stake`);
+    const slotsEl = document.getElementById(`cfg-${bot}-slots`);
+    if (stakeEl && s.stake_usd !== undefined) stakeEl.value = s.stake_usd;
+    if (slotsEl && s.max_slots !== undefined) slotsEl.value = s.max_slots;
   });
+  // Scalper extra fields
+  const sc = data.scalper || {};
+  SCALPER_FIELDS.forEach(f => {
+    const el = document.getElementById(f.id);
+    if (!el || sc[f.key] === undefined) return;
+    el.value = f.pct ? (sc[f.key] * 100).toFixed(2) : (f.int ? sc[f.key] : parseFloat(sc[f.key]).toFixed(2));
+  });
+  // Lowcap / Grid
+  const lc = data.lowcap || {};
+  if (lc.max_orders_per_pair !== undefined) document.getElementById('cfg-lowcap-orders').value = lc.max_orders_per_pair;
+  const gb = data.grid_bot || {};
+  if (gb.max_active_symbols !== undefined) document.getElementById('cfg-grid_bot-pairs').value = gb.max_active_symbols;
 }
 
 async function saveSetting(bot) {
   const stake = parseFloat(document.getElementById(`cfg-${bot}-stake`).value);
   const slots = parseInt(document.getElementById(`cfg-${bot}-slots`).value, 10);
   const fb = document.getElementById(`fb-${bot}`);
-  if (!stake || !slots) { fb.style.color='var(--neon-r)'; fb.textContent='Błąd wartości'; return; }
+  const startBalanceText = document.getElementById('pf-start')?.textContent || '200';
+  const startBalance = parseFloat(String(startBalanceText).replace('$', '')) || 200;
+  if (!Number.isFinite(stake) || !Number.isFinite(slots) || stake <= 0 || slots < 1 || slots > 10) {
+    fb.style.color='var(--neon-r)'; fb.textContent='Błąd wartości'; return;
+  }
+  if ((stake * slots) > startBalance) {
+    fb.style.color='var(--neon-r)'; fb.textContent=`Ekspozycja > ${startBalance.toFixed(2)}$`; return;
+  }
+  let payload = {stake_usd: stake, max_slots: slots};
+  if (bot === 'scalper') {
+    SCALPER_FIELDS.forEach(f => {
+      const el = document.getElementById(f.id);
+      if (!el) return;
+      const raw = f.int ? parseInt(el.value, 10) : parseFloat(el.value);
+      if (!Number.isFinite(raw)) return;
+      payload[f.key] = f.pct ? raw / 100.0 : raw;
+    });
+  }
+  if (bot === 'lowcap') {
+    const ordersVal = parseInt(document.getElementById('cfg-lowcap-orders').value, 10);
+    if (Number.isFinite(ordersVal) && ordersVal >= 1) payload.max_orders_per_pair = ordersVal;
+  }
+  if (bot === 'grid_bot') {
+    const pairsVal = parseInt(document.getElementById('cfg-grid_bot-pairs').value, 10);
+    if (Number.isFinite(pairsVal) && pairsVal >= 1) payload.max_active_symbols = pairsVal;
+  }
   const r = await apiFetch(`/api/settings/${bot}`, {
     method: 'POST',
-    body: JSON.stringify({stake_usd: stake, max_slots: slots})
+    body: JSON.stringify(payload)
   });
   if (r && r.ok) {
     fb.style.color = 'var(--neon-g)'; fb.textContent = '✓ Zapisano';
@@ -1357,3 +1599,5 @@ setInterval(() => {
 </script>
 </body>
 </html>
+
+

@@ -1,4 +1,7 @@
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
+
+# Global trading safety mode
+TRADING_MODE: str = "paper"
 
 # ============================================================
 #   EXCHANGE CONFIG
@@ -21,79 +24,67 @@ class TelegramConfig:
 
 
 # ============================================================
-#   STATUS CONFIG – wspólne dla wszystkich botów
+#   STATUS CONFIG â€“ wspÃ³lne dla wszystkich botÃ³w
 # ============================================================
 
 @dataclass
 class StatusConfig:
     show_status_line: bool = True
-    default_status_text: str = "🔍 Skanuję rynek…"
+    default_status_text: str = "Skanuje rynek..."
     status_prefix: str = "STATUS_UPDATE::"
 
 
 # ============================================================
-#   SCALPER (Highcap)
+#   SCALPER
+#   Trading params → managed via web app (settings/scalper_settings.json)
+#   Infrastructure params → defaults below
 # ============================================================
 
 @dataclass
 class ScalperConfig:
     status: StatusConfig = field(default_factory=StatusConfig)
+    start_balance: float = 200.0
 
-    start_balance: float = 50.0
-    fee: float = 0.002
+    # ── Trading params (real defaults in main_web.py, set on startup) ──
+    slot_count: int = 0
+    max_stake_usd: float = 0.0
+    maker_fee: float = 0.0
+    target_profit_pct: float = 0.0
+    stop_loss_pct: float = 0.0
+    trailing_stop_pct: float = 0.0
+    max_trades_day: int = 0
+    daily_loss_limit_pct: float = 0.0
+    max_position_time_sec: float = 0.0
+    min_signal_strength: float = 0.0
+    symbol_cooldown_sec: float = 0.0
+    momentum_min_change: float = 0.0
+    volume_spike_mult: float = 0.0
+    atr_filter_min: float = 0.0
+    pullback_min_retrace: float = 0.0
+    pullback_max_retrace: float = 0.0
+    impulse_ttl_sec: float = 0.0
+    momentum_window_sec: float = 0.0
+    volume_baseline_window_sec: float = 0.0
+    trend_ema_period: int = 0
+    trend_window_sec: float = 0.0
 
-    # Position management
-    slot_count: int = 3
-    first_stake_pct: float = 0.20
-    max_stake_usd: float = 50.0          # górny limit na jedną pozycję
-    max_total_exposure: float = 0.70     # max 70% kapitału w otwartych pozycjach
+    # ── Infrastructure (not exposed in web) ──
+    max_position_size_usdt: float = 10.0
+    max_open_positions: int = 3
+    pair_refresh_sec: float = 30.0
+    ws_reconnect_max: int = 5
+    ws_reconnect_base: float = 1.0
+    exchange_timeout_sec: float = 30.0
+    monitor_poll_sec: float = 0.05
+    missed_retry_cooldown_sec: float = 2.0
+    sor_maker_wait_ms: int = 700
+    sor_aggressive_wait_ms: int = 500
+    max_pending_orders: int = 32
+    max_trade_rate_per_sec: float = 12.0
+    stale_max_age_ms: float = 500.0
+    symbol_loop_sleep_sec: float = 0.1
 
-    # EMA parameters
-    ema_fast: int = 9
-    ema_slow: int = 21
-    ema_macro: int = 50
-
-    # Entry scoring
-    min_score: int = 55
-    min_body_ratio: float = 0.45
-    max_upper_wick_ratio: float = 0.30
-    min_atr_pct: float = 0.002
-
-    # Risk management (ATR-based)
-    risk_per_trade_pct: float = 0.005    # 0.5% equity risked per trade
-    atr_sl_multiplier: float = 1.5       # SL = entry - 1.5 * ATR
-    atr_trail_multiplier: float = 1.5    # trailing stop distance = 1.5 * ATR
-    tp1_r_multiple: float = 2.0          # TP1 = entry + 2.0 * SL_distance
-    runner_activation_r: float = 2.5     # runner trail activates at +2.5R
-    tp1_qty_pct: float = 0.60            # sell 60% at TP1, run 40%
-
-    # Regime / alt breadth
-    btc_breakout_vol_mult: float = 1.5   # BTC vol spike counts as green light
-    btc_regime_cache_ttl: float = 60.0   # seconds to cache BTC regime result
-    alt_breadth_min_pct: float = 0.60    # min fraction of alts in uptrend
-    alt_breadth_cache_ttl: float = 300.0 # seconds to cache alt breadth result
-
-    # Entry filters
-    entry_body_ratio: float = 0.45       # min body/range ratio for entry candle
-    entry_vol_mult: float = 1.8          # volume must be > 1.8x rolling mean
-    entry_breakout_factor: float = 1.001 # close must be > prev_high * 1.001
-
-    # Circuit breaker (rolling WR)
-    rolling_wr_window: int = 10          # look at last N closed trades
-    rolling_wr_min: float = 0.20         # pause if WR drops below 20%
-    rolling_wr_pause: float = 3600.0     # 1h pause when WR circuit fires
-
-    # Per-scan throttle
-    max_entries_per_scan: int = 2        # max new entries per main loop iteration
-
-    # Timing
-    cooldown_seconds: float = 60.0
-    ohlcv_cache_ttl: float = 15.0    # odświeżaj OHLCV co 15 sekund
-
-    # Daily loss limit
-    daily_loss_limit_pct: float = 0.05  # stop gdy dzienna strata > 5% start_balance
-
-    # 30 coinów do skalpowania
+    # Symbols
     gigants: tuple = (
         "BTC/USDT",
         "ETH/USDT",
@@ -101,30 +92,6 @@ class ScalperConfig:
         "BNB/USDT",
         "XRP/USDT",
         "DOGE/USDT",
-        "ADA/USDT",
-        "AVAX/USDT",
-        "LINK/USDT",
-        "MATIC/USDT",
-        "LTC/USDT",
-        "DOT/USDT",
-        "NEAR/USDT",
-        "UNI/USDT",
-        "ATOM/USDT",
-        "FIL/USDT",
-        "ICP/USDT",
-        "APT/USDT",
-        "ARB/USDT",
-        "OP/USDT",
-        "INJ/USDT",
-        "SUI/USDT",
-        "TIA/USDT",
-        "SEI/USDT",
-        "WLD/USDT",
-        "PEPE/USDT",
-        "SHIB/USDT",
-        "FLOKI/USDT",
-        "BONK/USDT",
-        "WIF/USDT",
     )
 
 
@@ -134,177 +101,130 @@ class ScalperConfig:
 
 @dataclass
 class LowcapConfig:
-    status: StatusConfig = field(default_factory=StatusConfig)
+    status: StatusConfig = field(default_factory=lambda: StatusConfig(
+        default_status_text="Micro-Reversion gotowy"
+    ))
 
     start_balance: float = 50.0
-    fee: float = 0.002
-    min_stake_usd: float = 1.0
-    max_stake_per_trade: float = 50.0
-    stake_pct: float = 0.10
 
-    vol_min: int = 600_000
-    vol_max: int = 5_000_000
-    price_min: float = 0.001
+    # Capital / concurrency
+    position_size: float = 5.0           # USDT per entry
+    max_pairs: int = 4                   # active symbols (3-4 recommended)
+    max_orders_per_pair: int = 2         # avoid capital lock per symbol
 
-    max_spread: float = 0.004
-    min_orderbook_liquidity: float = 400.0
-    min_hold_seconds: float = 15.0
-    hard_sl_pct: float = 0.011          # fixed -1.1% SL instead of broken ATR-based
-    cooldown_after_sl: float = 180.0
+    # Aliases required by main_web.py settings system (apply_settings_to_engines)
+    max_stake_per_trade: float = 5.0     # mirrors position_size
+    max_positions: int = 4               # mirrors max_pairs
 
-    m1_ema_fast: int = 5
-    m1_ema_slow: int = 13
+    # Pair selection
+    vol_min: float = 200_000
+    vol_max: float = 20_000_000
+    spread_min_pct: float = 0.0002
+    spread_max_pct: float = 0.0150
+    min_daily_change_pct: float = 0.01  # prefer pairs with at least 1% daily move
+    max_scan_pairs: int = 20
+    price_min: float = 0.000001
+    blacklist: list = field(default_factory=lambda: [
+        "3L", "3S", "5L", "5S", "UP", "DOWN", "BEAR", "BULL",
+    ])
 
-    m5_ema_fast: int = 20
-    m5_ema_slow: int = 50
+    # Micro-Reversion strategy
+    buy_drop_min_pct: float = 0.01      # buy on 1%-3% pullback from local high
+    buy_drop_max_pct: float = 0.03
+    sell_rise_min_pct: float = 0.01     # sell on 1%-3% rebound from local low
+    sell_rise_max_pct: float = 0.03
+    trailing_enabled: bool = True
+    trailing_pct: float = 0.007         # 0.5%-1% trail
+    stop_loss_enabled: bool = True
+    stop_loss_pct: float = 0.07         # 5%-10% optional stop loss
+    entry_cooldown_s: float = 5.0
+    maker_fee: float = 0.0008
 
-    atr_length: int = 5
-    min_atr_pct: float = 0.003
+    # Daily circuit breaker
+    daily_loss_limit_usdt: float = 3.0
 
-    min_body_ratio: float = 0.55        # 0.45 → 0.55
-    max_upper_wick_ratio: float = 0.30
+    # Engine timing
+    rescan_interval_s: int = 300
+    loop_sleep: float = 0.5
+    order_refresh_ms: int = 500
 
-    min_body_ratio_score: float = 0.30
-    max_upper_wick_ratio_score: float = 0.40
-
-    min_vol_ratio: float = 2.5          # 1.8 → 2.5
-    min_candle_notional: float = 500.0  # 200 → 500
-    vol_burst_multiplier: float = 1.8
-
-    break_high_factor: float = 0.9985
-    break_close_factor: float = 0.996
-
-    target_profit: float = 0.018        # 1.5% → 1.8%
-    micro_tp: float = 0.010             # 0.8% → 1.0%
-    trailing_stop: float = 0.005        # 0.8% → 0.5%
-    break_even: float = 0.006           # 0.35% → 0.6%
-
-    min_reentry_price: float = 0.005
-    reentry_breakout: float = 1.003
-    reentry_min_vol_ratio: float = 2.0
-    reentry_stake_pct: float = 0.07
-
-    dyn_threshold_base: int = 46        # 40 → 46
-    dyn_threshold_mid: int = 50         # 44 → 50
-    dyn_threshold_high: int = 48
-    dyn_threshold_top: int = 52
-    dyn_wr_mid: float = 0.58
-    dyn_wr_high: float = 0.63
-    dyn_wr_top: float = 0.68
-
-    scan_limit: int = 20
-    loop_sleep: float = 0.10
-    cooldown_seconds: float = 60.0      # re-enter faster after wins
-
-    ai_db_file: str = "ai_trades_lowcap.json"
-    min_ai_samples: int = 100
-    ai_boost: int = 12
-
-    max_positions: int = 5
-    score_threshold_boost: int = 12
-
-    # Circuit breaker
-    max_consecutive_losses: int = 3
-    consecutive_loss_pause: float = 5400.0   # 90 minutes pause after 3 SL in a row
-    sl_reentry_block_seconds: float = 3600.0
-
-    # Entry filters
-    max_spread_pct: float = 0.0025          # max 0.25% spread at entry
-    candle_body_ratio: float = 0.60         # minimum body/range ratio
-    max_atr_pct: float = 0.025              # reject if ATR > 2.5% (dump&pump)
-    btc_min_atr_pct: float = 0.003          # BTC M5 ATR must be > 0.3% (market alive)
-    vol_rolling_multiplier: float = 2.0     # volume must be > 2x rolling mean
-
-    # Blacklista stablecoinów i tokenów dźwigniowych
-    blacklist: tuple = (
-        "DAI/", "TUSD/", "FRAX/", "USDC/", "USDD/", "FDUSD/",
-        "BUSD/", "USDP/", "GUSD/", "LUSD/", "EUR/", "GBP/",
-        "3L/", "3S/", "5L/", "5S/", "2L/", "2S/",
-    )
+    db_path: str = "trades.db"
 
 
 # ============================================================
-#   PUMP CONFIG
+#   GRID BOT CONFIG
 # ============================================================
 
 @dataclass
-class PumpConfig:
+class GridBotConfig:
     status: StatusConfig = field(default_factory=StatusConfig)
 
-    symbol_filter: str = "/USDT"
-    max_symbols: int = 100
-    vol_min: int = 10_000
-    vol_max: int = 5_000_000
-
-    # Timing
-    window_seconds: float = 4.0
-    min_ticks_in_window: int = 6
-    scanner_interval: float = 1.0
-    long_history_limit: int = 62       # fetch 60min of 1m candles for slow pump baseline
-    slow_pump_min_change: float = 0.10 # minimum +15% in 60min to trigger slow pump
-    slow_pump_min_vol_spike: float = 5.0  # minimum 5x volume spike for slow pump
-    slow_pump_score_threshold: int = 10   # minimum score to enter on slow pump signal
-
-    # Entry
-    entry_score_threshold: int = 15
-    max_positions: int = 2
-    max_stake: float = 10.0
-    min_stake_usd: float = 5.0
-
-    # Exit — Moon Hunter: daj moonie żyć
-    hard_sl: float = -0.07
-    max_sl_pct: float = 0.035            # twardy cap SL: max 3.5% od entry
-    base_trailing: float = -0.020
-    trailing_min_profit: float = 0.03
-    trailing_mid_profit: float = 0.08
-    trailing_mid_drop: float = -0.05
-    trailing_high_profit: float = 0.20
-    trailing_high_drop: float = -0.10
-    time_exit_seconds: float = 360.0
-
-    # Dynamiczny trailing stop — progi zysku
-    trail_tier1_pct: float = 0.05         # do 5% zysku
-    trail_tier2_pct: float = 0.15         # do 15% zysku
-    trail_tier3_pct: float = 0.40         # do 40% zysku
-
-    # Trailing distance per tier
-    trail_distance_tier1: float = 0.015   # 1.5%
-    trail_distance_tier2: float = 0.030   # 3.0%
-    trail_distance_tier3: float = 0.050   # 5.0%
-    trail_distance_tier4: float = 0.080   # 8.0% dla 40%+
-
-    # Minimalna odległość od high żeby wyjść
-    hard_exit_from_high: float = 0.15     # 15% od szczytu
-
-    quick_exit_seconds: float = 120.0      # check for failed pump after 2 min
-    quick_exit_threshold: float = -0.005   # exit if profit < -0.5% after 2 min
-    quick_exit_min_loss: float = 0.015     # min 1.5% straty żeby QUICK exit zadziałał
-    max_entries_per_coin_per_day: int = 2  # max 2 entries per coin per session
-    cooldown_after_sl: float = 1800.0      # 30 min cooldown after SL on that coin
-    sl_reentry_block_seconds: float = 7200.0  # 2h blokada re-entry po SL
-
-    fee_rate: float = 0.002
     start_balance: float = 50.0
-    db_path: str = "trades.db"
 
-    cooldown_seconds: float = 900.0
+    # Symbol selection
+    symbol_filter: str = "/USDT"
+    vol_min: float = 100_000           # min 24h USDT volume
+    vol_max: float = 20_000_000        # max 24h USDT volume
+    max_symbols_to_scan: int = 30
 
-    # Dzienny limit strat
+    # Grid parameters
+    grid_levels: int = 5               # buy levels below mid-price
+    grid_spacing_pct: float = 0.005    # 0.5% fallback spacing (if ATR unavailable)
+    atr_period: int = 14
+    atr_timeframe: str = "1h"
+    atr_spacing_mult: float = 0.3      # level spacing = 0.3 * ATR
+    atr_range_mult: float = 2.0        # total grid range = 2.0 * ATR below mid
+
+    # Position sizing
+    position_size_usdt: float = 10.0   # USDT budget per grid level
+    max_stake_per_trade: float = 10.0  # alias required by main_web.py
+    max_positions: int = 5             # max concurrent filled levels (orders per pair)
+    max_active_symbols: int = 1        # how many symbols to trade simultaneously
+
+    # Exit
+    sell_above_buy_pct: float = 0.006  # sell at buy * (1 + 2*this + maker_fee)
+    maker_fee: float = 0.0008
+    taker_fee: float = 0.002
+
+    # Grid management
+    rebalance_interval_s: float = 1800.0   # rebuild grid every 30 min
+    grid_reset_pct: float = 0.03           # rebuild if price drifts 3% from center
+
+    # Daily loss limit
     daily_loss_limit_pct: float = 0.10
 
+    # Timing
+    loop_sleep: float = 2.0
+    order_check_interval_s: float = 5.0
+
+    db_path: str = "trades.db"
+
     blacklist: tuple = (
+        # Leveraged / inverse tokens
         '3L/', '3S/', '5L/', '5S/', '2L/', '2S/',
-        'DAI/', 'USDC/', 'USDD/', 'TUSD/', 'FRAX/', 'FDUSD/', 'BUSD/',
-        'EUR/', 'GBP/',
-        'USDT/USDT', 'ON/USDT'
+        # Fiat pairs
+        'EUR/', 'GBP/', 'USDT/USDT', 'ON/USDT',
+        # Stablecoins (USD-pegged)
+        'USDC/', 'BUSD/', 'DAI/', 'TUSD/', 'FDUSD/', 'USDD/',
+        'FRAX/', 'USDP/', 'GUSD/', 'PYUSD/', 'LUSD/', 'USDE/',
+        'CRVUSD/', 'GHO/', 'SUSD/', 'USDJ/', 'USTC/', 'MIM/',
+        'DOLA/', 'ALUSD/', 'FEI/', 'TRIBE/', 'RSR/', 'CUSD/',
+        'UST/', 'USDX/', 'USDK/', 'HUSD/', 'USDN/', 'USDQ/',
+        'ZUSD/', 'OUSD/', 'EUSD/', 'USD0/',
+        # EUR / other fiat stables
+        'EURS/', 'EURT/', 'AGEUR/', 'EUROC/', 'STEUR/',
+        # Gold-backed stables
+        'XAUT/', 'PAXG/',
     )
 
 
 # ============================================================
-#   INSTANCJA EXCHANGE (dla wszystkich botów)
+#   INSTANCJA EXCHANGE (dla wszystkich botÃ³w)
 # ============================================================
 
 EXCHANGE = ExchangeConfig(
     api_key="WSTAW_API_KEY",
     secret_key="WSTAW_SECRET_KEY"
 )
+
+

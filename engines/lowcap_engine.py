@@ -1,21 +1,19 @@
-import ccxt
-import pandas as pd
-import pandas_ta as ta
-import time
-import random
-import json
-import re
+﻿import sqlite3
 import threading
-import requests
-import urllib3
+import time
 from datetime import datetime
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import ccxt
+import requests
+import urllib3
 
-from config import LowcapConfig, EXCHANGE
-from market_data import MarketData
-from vault import TELEGRAM_LOWCAP
 from analytics_engine import get_analytics
+from config import EXCHANGE, TRADING_MODE, LowcapConfig
+from market_data import MarketData
+from paper_execution import PaperExecution
+from vault import TELEGRAM_LOWCAP
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def send_telegram(msg, token, chat_id):
@@ -34,74 +32,73 @@ def send_telegram(msg, token, chat_id):
 
 
 class LowcapEngine:
+    """Micro-Reversion Ping-Pong engine for small-capital paper trading."""
+
     def __init__(self, cfg: LowcapConfig, log_callback=None,
                  market_data: MarketData | None = None, tg=None, portfolio=None):
         self.cfg = cfg
-        self.analytics = get_analytics('lowcap')
-        self._trade_ids: dict = {}
         self.market_data = market_data
         self.tg = tg
         self.portfolio = portfolio
+        self.log_callback = log_callback
+        self.current_status = self.cfg.status.default_status_text
+
+        if TRADING_MODE != "paper":
+            raise RuntimeError("LowcapEngine blocks real trading. Set TRADING_MODE='paper'.")
 
         self.exchange = ccxt.gateio({
-            'apiKey': EXCHANGE.api_key,
-            'secret': EXCHANGE.secret_key,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
+            "apiKey": EXCHANGE.api_key,
+            "secret": EXCHANGE.secret_key,
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
         })
+        self.paper_execution = PaperExecution(self.portfolio, self.market_data) if self.portfolio else None
 
-        self.active_positions = {}
-        self.cooldowns = {}
-        self.total_session_profit = 0.0
-        self.consecutive_losses = 0
-        self._pause_until: float = 0.0
-        self._last_sl_symbols: dict = {}
-        self.balance = self.cfg.start_balance
-        self.wins = 0
-        self.losses = 0
+        self.analytics = get_analytics("lowcap")
+        self._trade_ids: dict[str, str] = {}
+
         self.running = False
-
         self.stop_event = threading.Event()
         self.thread = None
 
-        self._ohlcv_cache = {}   # {(symbol, timeframe): {"data": list, "ts": float}}
-        self._ohlcv_cache_ttl = 20.0  # sekundy
+        self.balance = self.cfg.start_balance
+        self.total_session_profit = 0.0
+        self.wins = 0
+        self.losses = 0
+        self._daily_loss = 0.0
 
-        self.ai_db = self.load_ai_db()
-        self.last_prices = {}
-        self.log_callback = log_callback
+        self.active_positions: dict = {}
+        self._pos_lock = threading.Lock()
+        self.active_pairs: dict[str, threading.Thread] = {}
+        self._pairs_lock = threading.Lock()
+        self._pair_stats: dict[str, dict] = {}
+        self._scan_universe: list[str] = []
+        self._last_scan_refresh = 0.0
 
-        self.current_status = self.cfg.status.default_status_text
-        self.all_symbols = None
+        self.init_db()
 
-    # ============================
-    #         STATUS SYSTEM
-    # ============================
+    # ----------------------------
+    # Logging / status
+    # ----------------------------
     def set_status(self, text: str):
         if text != self.current_status:
             self.current_status = text
             if self.log_callback and self.cfg.status.show_status_line:
                 try:
                     self.log_callback(f"STATUS_UPDATE::{text}")
-                except:
+                except Exception:
                     pass
 
-    # ============================
-    #         LOGGING
-    # ============================
     def gui_log(self, msg: str):
         if self.log_callback:
             try:
                 self.log_callback(msg)
-            except:
+            except Exception:
                 pass
 
     def log(self, msg: str):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-    # ============================
-    #         TELEGRAM
-    # ============================
     def _send_tg(self, msg: str):
         self.log(msg)
         send_telegram(msg, TELEGRAM_LOWCAP.token, TELEGRAM_LOWCAP.chat_id)
@@ -115,25 +112,20 @@ class LowcapEngine:
 
     def get_status_text(self) -> str:
         bal = self.portfolio.balance_usdt if self.portfolio else self.balance
-        equity = bal + sum(p['stake'] for p in self.active_positions.values())
+        with self._pos_lock:
+            pos_count = len(self.active_positions)
+            pos_lines = [
+                f"- {sym} | Orders: {len(pos.get('orders', []))} | Stake: {pos.get('stake', 0.0):.2f}$"
+                for sym, pos in self.active_positions.items()
+            ]
         total = self.wins + self.losses
         win_pct = f"{self.wins / total * 100:.0f}" if total > 0 else "0"
         lines = [
-            "📊 *LOWCAP SCALPER*",
-            "━━━━━━━━━━━━━━━━━",
-            f"💰 Balance: *{bal:.2f}$*",
-            f"📈 Equity: *{equity:.2f}$*",
-            f"📊 Win Rate: W:{self.wins}/L:{self.losses} ({win_pct}%)",
-            f"🔓 Otwarte pozycje ({len(self.active_positions)}/{self.cfg.max_positions}):",
-        ]
-        for sym, pos in self.active_positions.items():
-            cur_price = self.last_prices.get(sym)
-            if cur_price:
-                cur_pnl = round((cur_price / pos['buy'] - 1) * pos['stake'], 2)
-                pnl_sign = "+" if cur_pnl >= 0 else ""
-                lines.append(f"• {sym} | Entry: {pos['buy']:.8f} | PnL: {pnl_sign}{cur_pnl}$")
-            else:
-                lines.append(f"• {sym} | Entry: {pos['buy']:.8f}")
+            "MICRO-REVERSION PING-PONG",
+            f"Balance: {bal:.2f}$",
+            f"Win Rate: W:{self.wins}/L:{self.losses} ({win_pct}%)",
+            f"Active pairs ({pos_count}/{self.cfg.max_pairs}):",
+        ] + pos_lines
         return "\n".join(lines)
 
     def _handle_command(self, text: str) -> str:
@@ -141,535 +133,390 @@ class LowcapEngine:
             return self.get_status_text()
         return ""
 
-    # ============================
-    #         AI DB
-    # ============================
-    def load_ai_db(self):
+    # ----------------------------
+    # Database
+    # ----------------------------
+    def init_db(self):
         try:
-            with open(self.cfg.ai_db_file, "r") as f:
-                return json.load(f)
-        except:
-            return []
+            con = sqlite3.connect(self.cfg.db_path)
+            cur = con.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT,
+                    engine TEXT,
+                    symbol TEXT,
+                    side TEXT,
+                    price REAL,
+                    qty REAL,
+                    stake REAL,
+                    pnl REAL,
+                    reason TEXT,
+                    spread_captured REAL DEFAULT 0
+                )
+                """
+            )
+            con.commit()
+            con.close()
+        except Exception as e:
+            self.log(f"DB init error: {e}")
 
-    def save_ai_db(self):
+    def log_trade_to_db(self, symbol, side, price, qty, stake, pnl, reason):
         try:
-            with open(self.cfg.ai_db_file, "w") as f:
-                json.dump(self.ai_db, f)
-        except:
-            pass
+            con = sqlite3.connect(self.cfg.db_path)
+            cur = con.cursor()
+            cur.execute(
+                "INSERT INTO trades (ts, engine, symbol, side, price, qty, stake, pnl, reason, spread_captured) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (datetime.now().isoformat(), "lowcap", symbol, side, price, qty, stake, pnl, reason, 0.0),
+            )
+            con.commit()
+            con.close()
+        except Exception as e:
+            self.log(f"DB write error: {e}")
 
-    def is_blacklisted(self, symbol: str) -> bool:
-        return bool(re.search(r'\d[LS]', symbol)) or "3L" in symbol or "3S" in symbol
+    # ----------------------------
+    # Pair scanning
+    # ----------------------------
+    def _refresh_universe(self, force: bool = False):
+        if not self.market_data:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_scan_refresh < self.cfg.rescan_interval_s:
+            return
+        tickers = self.market_data.get_all_tickers() or {}
+        if len(tickers) < 50:
+            return
 
-    # ============================
-    #         AI / SCORING
-    # ============================
-    def ai_score_boost(self, score, features):
-        if len(self.ai_db) < self.cfg.min_ai_samples:
-            return score
+        candidates = []
+        for sym, t in tickers.items():
+            if "/USDT" not in sym or ":" in sym or "-" in sym:
+                continue
+            if any(b in sym for b in self.cfg.blacklist):
+                continue
+            vol = float(t.get("quoteVolume") or 0)
+            if not (self.cfg.vol_min <= vol <= self.cfg.vol_max):
+                continue
+            bid = float(t.get("bid") or 0)
+            ask = float(t.get("ask") or 0)
+            last = float(t.get("last") or 0)
+            if bid <= 0 or ask <= 0 or last <= self.cfg.price_min:
+                continue
+            spread_pct = (ask - bid) / max(bid, 1e-12)
+            if not (self.cfg.spread_min_pct <= spread_pct <= self.cfg.spread_max_pct):
+                continue
+            pct = abs(float(t.get("percentage") or 0)) / 100.0
+            if pct < self.cfg.min_daily_change_pct:
+                continue
+            candidates.append((sym, vol))
 
-        similar = [
-            t for t in self.ai_db
-            if abs(t['vol_ratio'] - features['vol_ratio']) < 0.8
-            and abs(t['atr'] - features['atr']) < 0.01
-        ]
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        self._scan_universe = [s for s, _ in candidates[: self.cfg.max_scan_pairs]]
+        self._last_scan_refresh = now
+        self.log(f"[PAIR] Micro-Reversion pairs updated: {len(self._scan_universe)}")
 
-        if len(similar) < 8:
-            return score
+    def scan_pairs(self) -> list[str]:
+        return list(self._scan_universe)
 
-        wr = sum(t['win'] for t in similar) / len(similar)
+    # ----------------------------
+    # Trading primitives
+    # ----------------------------
+    def _fetch_bid_ask_last(self, symbol: str) -> tuple[float | None, float | None, float | None]:
+        bid = self.market_data.get_bid_price(symbol) if self.market_data else None
+        ask = self.market_data.get_ask_price(symbol) if self.market_data else None
+        last = self.market_data.get_last_price(symbol) if self.market_data else None
+        return bid, ask, last
 
-        if wr > 0.6:
-            score += self.cfg.ai_boost
-        elif wr < 0.4:
-            score -= self.cfg.ai_boost
+    def _ensure_pair_state(self, symbol: str, price: float):
+        if symbol not in self._pair_stats:
+            self._pair_stats[symbol] = {
+                "local_high": price,
+                "local_low": price,
+                "last_entry_ts": 0.0,
+            }
 
-        return score
+    def _sync_position_snapshot(self, symbol: str):
+        with self._pos_lock:
+            pair = self._pair_stats.get(symbol, {})
+            orders = pair.get("orders", [])
+            if orders:
+                total = sum(o["stake"] for o in orders)
+                self.active_positions[symbol] = {
+                    "stake": total,
+                    "original_stake": total,
+                    "orders": list(orders),
+                }
+            else:
+                self.active_positions.pop(symbol, None)
 
-    def dynamic_score_threshold(self):
-        total = self.wins + self.losses
-        if total < 20:
-            return self.cfg.dyn_threshold_base
+    def _open_buy(self, symbol: str, ask_price: float):
+        pair = self._pair_stats[symbol]
+        orders = pair.setdefault("orders", [])
 
-        wr = self.wins / total
+        if len(orders) >= int(self.cfg.max_orders_per_pair):
+            return
 
-        if wr > self.cfg.dyn_wr_top:
-            return self.cfg.dyn_threshold_top
-        elif wr > self.cfg.dyn_wr_high:
-            return self.cfg.dyn_threshold_high
-        elif wr > self.cfg.dyn_wr_mid:
-            return self.cfg.dyn_threshold_mid
-        else:
-            return self.cfg.dyn_threshold_base
+        now = time.monotonic()
+        if now - float(pair.get("last_entry_ts", 0.0)) < float(self.cfg.entry_cooldown_s):
+            return
 
-    # ============================
-    #         TREND / ŚWIECE
-    # ============================
-    def micro_trend_ok(self, df: pd.DataFrame) -> bool:
-        df['EMA_fast'] = ta.ema(df['close'], self.cfg.m1_ema_fast)
-        df['EMA_slow'] = ta.ema(df['close'], self.cfg.m1_ema_slow)
-        if df[['EMA_fast', 'EMA_slow']].isna().iloc[-1].any():
-            return False
-        return df['EMA_fast'].iloc[-1] > df['EMA_slow'].iloc[-1]
+        avail = self.portfolio.get_balance("USDT") if self.portfolio else self.balance
+        stake = min(float(self.cfg.max_stake_per_trade), avail)
+        if stake < 1.0 or ask_price <= 0:
+            return
 
-    def score_symbol(self, df: pd.DataFrame, prev_high: float):
-        last = df.iloc[-1]
-        vol_mean = df['vol'].rolling(10).mean().iloc[-1]
-        vol_ratio = last['vol'] / vol_mean if vol_mean > 0 else 1
-        candle_range = last['high'] - last['low']
-        body = abs(last['close'] - last['open'])
+        qty = stake / ask_price
 
-        score = 0
+        if self.portfolio and not self.portfolio.reserve_balance("USDT", stake):
+            return
 
-        # Require real breakout: CLOSE must be above prev_high (not just wick)
-        cond_break = last['close'] > prev_high * self.cfg.break_high_factor
-        cond_close = last['close'] > prev_high * self.cfg.break_close_factor
+        try:
+            order = self.paper_execution.create_order(symbol, "market", "buy", qty)
+            fill = float(order.get("average") or order.get("price") or ask_price)
+        except Exception as e:
+            if self.portfolio:
+                self.portfolio.release_balance("USDT", stake)
+            self.log(f"BUY failed {symbol}: {e}")
+            return
 
-        # Candle must be bullish with strong body
-        cond_body = (
-            candle_range > 0
-            and (body / candle_range) >= self.cfg.candle_body_ratio
-            and last['close'] > last['open']  # bullish candle required
+        pos = {
+            "buy_price": fill,
+            "qty": qty,
+            "stake": stake,
+            "low_since_buy": fill,
+            "peak_since_buy": fill,
+            "trail_active": False,
+            "trail_stop": None,
+            "open_ts": time.monotonic(),
+        }
+        orders.append(pos)
+        pair["last_entry_ts"] = now
+
+        _ml = self.analytics.on_entry(
+            symbol=symbol,
+            entry_price=fill,
+            stake=stake,
+            sl_pct=float(self.cfg.stop_loss_pct),
+            tp1_pct=float(self.cfg.sell_rise_min_pct),
+            features={"mode": "micro_reversion", "drop_min": self.cfg.buy_drop_min_pct},
         )
+        self._trade_ids[f"{symbol}:{id(pos)}"] = _ml["trade_id"]
 
-        if cond_break and cond_close and cond_body:
-            score += 35
+        msg = f"BUY {symbol} | Entry: {fill:.8f} | Stake: {stake:.2f}$"
+        self.gui_log(msg)
+        self.log(msg)
 
-        # Rolling mean check: current volume must exceed 2x 10-candle average
-        rolling_mean_10 = df['vol'].rolling(10).mean().iloc[-1]
-        vol_vs_rolling = last['vol'] / rolling_mean_10 if rolling_mean_10 > 0 else 0
-
-        # Volume must also be greater than previous candle (momentum building)
-        vol_prev = df['vol'].iloc[-2] if len(df) >= 2 else 0
-        vol_increasing = last['vol'] > vol_prev
-
-        vol_burst = vol_vs_rolling >= self.cfg.vol_rolling_multiplier and vol_increasing
-
-        if not vol_burst:
-            # Volume too weak — no real momentum
-            return 0, vol_ratio
-
-        if vol_ratio > 1.05:
-            score += 25
-        if vol_ratio > 1.3:
-            score += 35
-        if vol_burst:
-            score += 20
-
-        upper_wick = last['high'] - max(last['open'], last['close'])
-        if candle_range > 0:
-            upper_wick_ratio = upper_wick / candle_range
-            if upper_wick_ratio < self.cfg.max_upper_wick_ratio_score:
-                score += 10
-
-        return score, vol_ratio
-
-    # ============================
-    #         FILTRY WEJŚCIA
-    # ============================
-    def passes_market_filters(self, symbol: str, ticker: dict) -> bool:
-        if '/USDT' not in symbol:
+    def _close_sell(self, symbol: str, pos: dict, sell_price: float, reason: str):
+        qty = float(pos["qty"])
+        stake = float(pos["stake"])
+        try:
+            order = self.paper_execution.create_order(symbol, "market", "sell", qty)
+            sell_fill = float(order.get("average") or order.get("price") or sell_price)
+        except Exception as e:
+            self.log(f"SELL failed {symbol}: {e}")
             return False
 
-        if any(x in symbol for x in [":", "-", "3L", "3S", "5L", "5S"]):
-            return False
+        gross = qty * sell_fill
+        fees = stake * float(self.cfg.maker_fee) + gross * float(self.cfg.maker_fee)
+        pnl = gross - stake - fees
 
-        if any(bl in symbol for bl in self.cfg.blacklist):
-            return False
+        if self.portfolio:
+            self.portfolio.release_balance("USDT", stake)
+        else:
+            self.balance += stake + pnl
 
-        vol = ticker.get('quoteVolume') or 0
-        if not (self.cfg.vol_min <= vol <= self.cfg.vol_max):
-            return False
+        self.total_session_profit += pnl
+        if pnl >= 0:
+            self.wins += 1
+        else:
+            self.losses += 1
+            self._daily_loss += abs(pnl)
 
-        if self.is_blacklisted(symbol):
-            return False
+        self.log_trade_to_db(symbol, "sell", sell_fill, qty, stake, pnl, reason)
 
-        if symbol in self.active_positions or time.time() <= self.cooldowns.get(symbol, 0):
-            return False
+        tid = self._trade_ids.pop(f"{symbol}:{id(pos)}", None)
+        if tid:
+            self.analytics.on_exit(
+                trade_id=tid,
+                exit_reason=reason,
+                pnl=pnl,
+                pnl_pct=(pnl / stake) if stake > 0 else 0,
+            )
 
-        price = ticker.get('last')
-        if price is None or price < self.cfg.price_min:
-            return False
-
-        # Reject if spread is too wide (no liquidity)
-        if self.market_data:
-            spread = self.market_data.get_spread_pct(symbol)
-            if spread > self.cfg.max_spread:
-                return False
-
-        # Reject if ask price unavailable
-        if self.market_data:
-            ask = self.market_data.get_ask_price(symbol)
-            if ask is None or ask <= 0:
-                return False
-
+        icon = "✅" if pnl >= 0 else "❌"
+        msg = (
+            f"{icon} SELL {symbol} | {reason} | Entry: {pos['buy_price']:.8f} | "
+            f"Sell: {sell_fill:.8f} | PnL: {pnl:+.2f}$ | {self._wr_text()}"
+        )
+        self.gui_log(msg)
+        self.log(msg)
         return True
 
-    # ============================
-    #         OHLCV CACHE
-    # ============================
-    def _get_ohlcv_cached(self, symbol: str, timeframe: str, limit: int) -> list:
-        key = (symbol, timeframe)
-        now = time.monotonic()
-        cached = self._ohlcv_cache.get(key)
-        if cached and (now - cached["ts"]) < self._ohlcv_cache_ttl:
-            return cached["data"]
-        data = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        self._ohlcv_cache[key] = {"data": data, "ts": now}
-        return data
+    def _manage_orders_for_pair(self, symbol: str, bid: float, ask: float, last: float):
+        pair = self._pair_stats[symbol]
+        orders = pair.setdefault("orders", [])
+        if not orders:
+            return
 
-    # ============================
-    #         GŁÓWNA PĘTLA
-    # ============================
+        sell_min = float(self.cfg.sell_rise_min_pct)
+        sell_max = float(self.cfg.sell_rise_max_pct)
+        target_pct = min(max((sell_min + sell_max) / 2.0, sell_min), sell_max)
+
+        to_remove = []
+        for pos in orders:
+            pos["low_since_buy"] = min(float(pos["low_since_buy"]), bid)
+            pos["peak_since_buy"] = max(float(pos["peak_since_buy"]), bid)
+
+            buy_price = float(pos["buy_price"])
+            low_ref = max(float(pos["low_since_buy"]), 1e-12)
+            rebound = (bid - low_ref) / low_ref
+            drawdown = (buy_price - bid) / max(buy_price, 1e-12)
+
+            reason = None
+
+            if bool(self.cfg.stop_loss_enabled) and drawdown >= float(self.cfg.stop_loss_pct):
+                reason = "STOP_LOSS"
+            else:
+                target_price = low_ref * (1.0 + target_pct)
+                if bid >= target_price:
+                    if bool(self.cfg.trailing_enabled):
+                        pos["trail_active"] = True
+                        trail_stop = float(pos.get("trail_stop") or 0.0)
+                        new_stop = bid * (1.0 - float(self.cfg.trailing_pct))
+                        pos["trail_stop"] = max(trail_stop, new_stop)
+                    else:
+                        reason = "PING_PONG_TP"
+
+                if bool(pos.get("trail_active")) and pos.get("trail_stop"):
+                    if bid <= float(pos["trail_stop"]) and bid > buy_price:
+                        reason = "TRAIL_EXIT"
+
+            if reason:
+                if self._close_sell(symbol, pos, bid, reason):
+                    to_remove.append(pos)
+
+        for p in to_remove:
+            try:
+                orders.remove(p)
+            except ValueError:
+                pass
+
+    # ----------------------------
+    # Per-pair thread
+    # ----------------------------
+    def _run_pair(self, symbol: str):
+        cfg = self.cfg
+        self.log(f"Micro-Reversion task started: {symbol}")
+
+        while not self.stop_event.is_set():
+            if self._daily_loss >= float(cfg.daily_loss_limit_usdt):
+                self.set_status("Daily loss limit reached")
+                break
+
+            bid, ask, last = self._fetch_bid_ask_last(symbol)
+            if not bid or not ask or not last:
+                time.sleep(cfg.loop_sleep)
+                continue
+
+            self._ensure_pair_state(symbol, last)
+            pair = self._pair_stats[symbol]
+            pair["local_high"] = max(float(pair.get("local_high", last)), last)
+            pair["local_low"] = min(float(pair.get("local_low", last)), last)
+
+            # Manage open orders first
+            self._manage_orders_for_pair(symbol, bid, ask, last)
+
+            # Entry logic: buy dip from local high
+            orders = pair.setdefault("orders", [])
+            local_high = max(float(pair.get("local_high", last)), 1e-12)
+            drop_pct = (local_high - last) / local_high
+            if len(orders) < int(cfg.max_orders_per_pair):
+                if float(cfg.buy_drop_min_pct) <= drop_pct <= float(cfg.buy_drop_max_pct):
+                    self._open_buy(symbol, ask)
+                    # reset high anchor after execution to avoid immediate overtrading
+                    pair["local_high"] = last
+                    pair["local_low"] = min(float(pair.get("local_low", last)), last)
+
+            # If flat for long, refresh anchors around current price slowly
+            if not orders:
+                pair["local_low"] = last
+                if last > pair["local_high"]:
+                    pair["local_high"] = last
+
+            self._sync_position_snapshot(symbol)
+            time.sleep(cfg.loop_sleep)
+
+        with self._pairs_lock:
+            self.active_pairs.pop(symbol, None)
+        self._sync_position_snapshot(symbol)
+        self.log(f"Micro-Reversion task stopped: {symbol}")
+
+    # ----------------------------
+    # Orchestrator
+    # ----------------------------
     def loop(self):
-
-        scan_counter = 0
-
-        self._send_tg(
-            f"*LOWCAP SCALPER START* | Vol: {self.cfg.vol_min}-{self.cfg.vol_max}"
-        )
-        self.set_status("🏁 Lowcap startuje…")
+        self._send_tg("MICRO-REVERSION START")
+        self.set_status("Micro-Reversion ready")
 
         try:
-            self.log("Inicjalizacja rynków Gate.io...")
             self.exchange.load_markets()
-            self.all_symbols = [
-                s for s in self.exchange.markets
-                if "/USDT" in s and ":" not in s and "-" not in s and "3L" not in s and "3S" not in s
-            ]
-            self.log(f"Załadowano {len(self.all_symbols)} czystych par USDT.")
         except Exception as e:
-            self.log(f"BŁĄD inicjalizacji giełdy: {e}")
-            self.set_status("❌ Błąd inicjalizacji giełdy")
+            self.log(f"load_markets error: {e}")
             self.running = False
             return
 
+        self._refresh_universe(force=True)
+
         while not self.stop_event.is_set():
             try:
-
-                scan_counter += 1
-
-                if self.market_data is None:
-                    self.log("ERR: MarketData is None – lowcap nie ma ticków.")
-                    self.set_status("❌ Brak MarketData – czekam…")
-                    time.sleep(1)
+                if self.market_data and len(self.market_data.last_prices) < 100:
+                    self.set_status("Warmup MarketData")
+                    time.sleep(2)
                     continue
 
-                all_tickers = self.market_data.get_all_tickers()
-                if not all_tickers:
-                    all_tickers = self.exchange.fetch_tickers()
+                self._refresh_universe(force=False)
 
-                # ---------- SELL LOGIC ----------
-                to_remove = []
+                with self._pairs_lock:
+                    running_syms = set(self.active_pairs.keys())
 
-                for s, pos in list(self.active_positions.items()):
-                    price = self.market_data.get_last_price(s) or (all_tickers.get(s, {}).get('last'))
-                    if price is None:
+                candidates = self.scan_pairs()
+                target_pairs = int(max(1, min(self.cfg.max_pairs, self.cfg.max_positions)))
+
+                for sym in candidates:
+                    if self.stop_event.is_set():
+                        break
+                    if sym in running_syms:
                         continue
-
-                    # Safety: backfill fields for legacy positions
-                    if 'entry_time' not in pos:
-                        pos['entry_time'] = time.time() - 60
-                    if 'atr_val' not in pos:
-                        pos['atr_val'] = 0  # legacy positions — no longer used for SL
-                    if 'sl_locked' not in pos:
-                        pos['sl_locked'] = False
-
-                    self.last_prices[s] = price
-
-                    if price > pos['max']:
-                        pos['max'] = price
-
-                    # Use bid price for realistic exit valuation
-                    bid_price = self.market_data.get_bid_price(s) if self.market_data else price
-                    eval_price = bid_price if bid_price and bid_price > 0 else price
-
-                    profit_pct = (eval_price / pos['buy']) - 1
-
-                    # Fixed percentage SL — ATR on quiet low-caps was ≈0, causing instant triggers
-                    sl_price = pos['buy'] * (1 - self.cfg.hard_sl_pct)
-
-                    # Minimum hold time before SL/TS can trigger
-                    hold_duration = time.time() - pos['entry_time']
-                    held_long_enough = hold_duration >= self.cfg.min_hold_seconds
-
-                    should_sell = False
-                    reason = ""
-
-                    if profit_pct >= self.cfg.target_profit:
-                        should_sell = True
-                        reason = "🟢 TP"
-                    elif held_long_enough:
-                        if (pos['max'] / pos['buy']) - 1 >= self.cfg.micro_tp:
-                            # Lock profit: move SL to BE+0.2% after micro TP is reached
-                            be_lock = pos['buy'] * 1.002
-                            if sl_price < be_lock:
-                                sl_price = be_lock
-                                pos['sl_locked'] = True
-                            if eval_price < pos['max'] * (1 - self.cfg.trailing_stop):
-                                should_sell = True
-                                reason = "TS 📉"
-                        if not should_sell and eval_price < sl_price:
-                            should_sell = True
-                            reason = "🔴 SL"
-
-                    if should_sell:
-                        self.set_status(f"💰 SELL {s}")
-
-                        sell_value = pos['qty'] * price
-                        net = sell_value - (sell_value * self.cfg.fee)
-                        gain = net - pos['stake']
-
-                        if self.portfolio:
-                            self.portfolio.balance_usdt += net
-                        else:
-                            self.balance += net
-                        self.total_session_profit += gain
-
-                        win = gain > 0
-                        icon = "✅" if win else "❌"
-                        if win:
-                            self.wins += 1
-                            self.consecutive_losses = 0  # reset on any win
-                        else:
-                            self.losses += 1
-                            if reason == "🔴 SL":
-                                self.consecutive_losses += 1
-                                if self.consecutive_losses >= self.cfg.max_consecutive_losses:
-                                    self._pause_until = (
-                                        time.monotonic()
-                                        + self.cfg.consecutive_loss_pause
-                                    )
-                                    pause_msg = f"⏸️ {self.cfg.max_consecutive_losses} SL z rzędu — pauza {int(self.cfg.consecutive_loss_pause // 60)} minut"
-                                    self.log(pause_msg)
-                                    self.gui_log(pause_msg)
-                            else:
-                                self.consecutive_losses = 0
-
-                        entry_price = pos['buy']
-                        sell_price = price
-
-                        wr = self._wr_text()
-                        sell_msg = f"{icon} SELL {s} | {reason} | Entry: {entry_price:.8f} | Sell: {sell_price:.8f} | PnL: {gain:.2f}$ | {wr}"
-                        self.gui_log(sell_msg)
-                        self._send_tg(sell_msg)
-
-                        # ── ML Analytics: rejestracja wyjścia ──
-                        _tid_lc = self._trade_ids.pop(s, None)
-                        if _tid_lc:
-                            self.analytics.on_exit(
-                                trade_id=_tid_lc,
-                                exit_reason=reason,
-                                pnl=gain,
-                                pnl_pct=gain / pos['stake'] if pos['stake'] > 0 else 0,
-                            )
-
-                        if reason == "🔴 SL":
-                            self._last_sl_symbols[s] = (
-                                time.monotonic()
-                                + self.cfg.sl_reentry_block_seconds
-                            )
-
-                        to_remove.append(s)
-                        if reason == "🔴 SL":
-                            self.cooldowns[s] = time.time() + self.cfg.cooldown_after_sl
-                        else:
-                            self.cooldowns[s] = time.time() + self.cfg.cooldown_seconds
-
-                for s in to_remove:
-                    del self.active_positions[s]
-
-                # ---------- BUY LOGIC ----------
-                max_pos = self.cfg.max_positions
-
-                avail_bal = self.portfolio.balance_usdt if self.portfolio else self.balance
-                if avail_bal >= self.cfg.min_stake_usd and len(self.active_positions) < max_pos:
-
-                    if time.monotonic() < self._pause_until:
-                        remaining = int(self._pause_until - time.monotonic())
-                        self.set_status(f"⏸️ Pauza ochronna — {remaining}s")
-                        time.sleep(5)
-                        continue
-
-                    # 🔥 OPTYMALIZACJA: Ogólny status zamiast wszystkich par w kółko
-                    self.set_status(f"Analiza M1 - Skanowanie ({len(self.all_symbols)} par)")
-
-                    candidates = []
-                    for s in self.all_symbols:
-                        ticker_data = all_tickers.get(s)
-                        if ticker_data and self.passes_market_filters(s, ticker_data):
-                            candidates.append(s)
-
-                    _EXCLUDED = [
-                        'USD1', 'USDC', 'BUSD', 'DAI', 'TUSD',
-                        'FDUSD', 'PAXG', 'XAUT', 'USDD', 'FRAX',
-                        'USDT', 'USDP',
-                    ]
-                    candidates = [
-                        s for s in candidates
-                        if not any(p in s.replace('/USDT', '') for p in _EXCLUDED)
-                    ]
-
-                    random.shuffle(candidates)
-
-                    btc_regime_ok = True
-                    try:
-                        btc_ohlcv = self.exchange.fetch_ohlcv("BTC/USDT", "5m", 20)
-                        if btc_ohlcv and len(btc_ohlcv) >= 15:
-                            btc_df = pd.DataFrame(btc_ohlcv,
-                                columns=["ts", "open", "high", "low", "close", "vol"])
-                            btc_atr = ta.atr(btc_df["high"], btc_df["low"],
-                                btc_df["close"], length=14)
-                            btc_price = float(btc_df["close"].iloc[-1])
-                            btc_atr_pct = float(btc_atr.iloc[-1]) / btc_price
-                            if btc_atr_pct < self.cfg.btc_min_atr_pct:
-                                btc_regime_ok = False
-                    except Exception:
-                        pass
-
-                    for s in candidates[:self.cfg.scan_limit]:
-                        if self.stop_event.is_set():
+                    with self._pairs_lock:
+                        if len(self.active_pairs) >= target_pairs:
                             break
+                        t = threading.Thread(target=self._run_pair, args=(sym,), daemon=True)
+                        self.active_pairs[sym] = t
+                        t.start()
+                    self.log(f"Started Micro-Reversion thread for {sym}")
 
-                        if time.monotonic() < self._last_sl_symbols.get(s, 0):
-                            continue
+                with self._pairs_lock:
+                    active_count = len(self.active_pairs)
+                with self._pos_lock:
+                    inv_count = len(self.active_positions)
 
-                        if not btc_regime_ok:
-                            self.set_status("💤 BTC martwy — pomijam skanowanie")
-                            break
-
-                        try:
-                            # Wyświetla tylko parę, która faktycznie wchodzi w analizę techniczną
-                            self.set_status(f"Analiza M1: {s}")
-                            ohlcv = self._get_ohlcv_cached(s, '1m', 50)
-                            if not ohlcv:
-                                continue
-
-                            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-                            if not self.micro_trend_ok(df):
-                                continue
-
-                            # M5 trend confirmation: EMA9 > EMA21 > EMA50, slope EMA21 positive
-                            try:
-                                ohlcv_5m = self._get_ohlcv_cached(s, '5m', 60)
-                                if ohlcv_5m and len(ohlcv_5m) >= 51:
-                                    df5 = pd.DataFrame(ohlcv_5m, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-                                    ema9_5  = ta.ema(df5['close'], length=9)
-                                    ema21_5 = ta.ema(df5['close'], length=21)
-                                    ema50_5 = ta.ema(df5['close'], length=50)
-                                    m5_trend_ok = (
-                                        float(ema9_5.iloc[-1])  > float(ema21_5.iloc[-1])
-                                        and float(ema21_5.iloc[-1]) > float(ema50_5.iloc[-1])
-                                    )
-                                    slope_ok = (
-                                        len(ema21_5) >= 3
-                                        and float(ema21_5.iloc[-1]) > float(ema21_5.iloc[-3])
-                                    )
-                                    if not (m5_trend_ok and slope_ok):
-                                        continue
-                            except Exception:
-                                pass  # if M5 data unavailable, allow entry
-
-                            price = all_tickers[s]['last']
-                            prev_high = df['high'].iloc[-2]
-                            base_score, v_ratio = self.score_symbol(df, prev_high)
-
-                            atr_val = ta.atr(df['high'], df['low'], df['close'], self.cfg.atr_length).iloc[-1]
-                            atr_pct = atr_val / price if price > 0 else 0
-
-                            # Reject dump&pump patterns — too volatile
-                            if atr_pct > self.cfg.max_atr_pct:
-                                continue
-
-                            final_score = self.ai_score_boost(base_score, {"vol_ratio": v_ratio, "atr": atr_pct})
-                            threshold = self.dynamic_score_threshold() + self.cfg.score_threshold_boost
-
-                            if final_score >= threshold:
-                                # Get real entry price (ask) not last
-                                ask_price = self.market_data.get_ask_price(s) if self.market_data else None
-                                if ask_price is None:
-                                    continue
-
-                                # Final spread check at moment of entry
-                                spread_at_entry = self.market_data.get_spread_pct(s) if self.market_data else 0
-                                if spread_at_entry > self.cfg.max_spread_pct:
-                                    self.log(f"⏭ SKIP {s} — spread at entry: {spread_at_entry*100:.2f}%")
-                                    continue
-
-                                self.set_status(f"💰 BUY {s}")
-
-                                avail = self.portfolio.balance_usdt if self.portfolio else self.balance
-                                stake = min(self.cfg.max_stake_per_trade, avail)
-
-                                if stake >= self.cfg.min_stake_usd:
-                                    # ── ML Analytics: rejestracja wejścia ──
-                                    _features_lc = {
-                                        'score':             final_score,
-                                        'vol_ratio':         v_ratio,
-                                        'body_ratio':        0.5,
-                                        'atr_pct':           atr_pct,
-                                        'upper_wick_ratio':  0.2,
-                                        'breakout_strength': 1.002,
-                                        'ema9_slope':        0.0,
-                                        'ema21_slope':       0.0,
-                                        'ema_spread':        0.0,
-                                        'btc_trend':         1 if btc_regime_ok else -1,
-                                        'btc_atr_pct':       0.0,
-                                        'btc_vol_ratio':     1.0,
-                                    }
-                                    _ml_lc = self.analytics.on_entry(
-                                        symbol=s, entry_price=ask_price, stake=stake,
-                                        sl_pct=self.cfg.hard_sl_pct,
-                                        tp1_pct=self.cfg.target_profit,
-                                        features=_features_lc,
-                                    )
-                                    self._trade_ids[s] = _ml_lc['trade_id']
-
-                                    if self.analytics.is_symbol_blocked(s):
-                                        continue
-                                    _ml_blocked_lc, _ml_reason_lc = self.analytics.is_trading_blocked()
-                                    if _ml_blocked_lc:
-                                        self.set_status(f"🤖 {_ml_reason_lc}")
-                                        continue
-
-                                    self.active_positions[s] = {
-                                        "buy": ask_price,
-                                        "max": ask_price,
-                                        "qty": stake / ask_price,
-                                        "stake": stake,
-                                        "vol_ratio": v_ratio,
-                                        "entry_time": time.time(),
-                                        "sl_locked": False,
-                                    }
-
-                                    if self.portfolio:
-                                        self.portfolio.balance_usdt -= stake
-                                    else:
-                                        self.balance -= stake
-
-                                    buy_msg = f"💰 BUY {s} | Entry Price: {ask_price:.8f} | Stawka: {stake:.2f}$"
-                                    self.gui_log(buy_msg)
-                                    self._send_tg(buy_msg)
-                                    break
-                        except Exception as e:
-                            continue
-
-                # Po skończeniu pętli analizy, ustawiamy status bezczynności/oczekiwania
-                self.set_status(f"Czekam... | Aktywne: {len(self.active_positions)}")
+                self.set_status(
+                    f"Micro-Reversion active: {active_count} pairs | Open sets: {inv_count} | Loss: {self._daily_loss:.2f}$"
+                )
                 time.sleep(self.cfg.loop_sleep)
 
             except Exception as e:
-                self.log(f"ERR: {e}")
-                self.set_status("❌ Błąd pętli – pauza 1s")
-                time.sleep(1)
+                self.log(f"orchestrator error: {e}")
+                time.sleep(2)
 
         self.running = False
-        self.set_status("🛑 BOT ZATRZYMANY")
-        self.log("Bot stopped cleanly.")
+        self.set_status("BOT STOPPED")
+        self.log("Micro-Reversion bot stopped.")
 
-    # ============================
-    #         START / STOP
-    # ============================
+    # ----------------------------
+    # Start/stop
+    # ----------------------------
     def start(self):
         if self.running:
             return

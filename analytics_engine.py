@@ -1,19 +1,19 @@
-"""
-analytics_engine.py — GateBot ML Analytics System v2
+﻿"""
+analytics_engine.py â€” GateBot ML Analytics System v2
 ======================================================
-Każdy bot ma OSOBNĄ instancję z własną bazą danych i modelami ML.
+KaÅ¼dy bot ma OSOBNÄ„ instancjÄ™ z wÅ‚asnÄ… bazÄ… danych i modelami ML.
 
-Poziomy ML (per bot, niezależnie):
+Poziomy ML (per bot, niezaleÅ¼nie):
   Poziom 1 (0-199 transakcji):   Rule Engine
   Poziom 2 (200-499):            + Logistic Regression
   Poziom 3 (500-999):            + Random Forest
   Poziom 4 (1000+):              + Meta Model (LightGBM)
 
-Użycie:
+UÅ¼ycie:
     from analytics_engine import get_analytics
     analytics = get_analytics('scalper')   # osobna instancja
     analytics = get_analytics('lowcap')    # osobna instancja
-    analytics = get_analytics('pump')      # osobna instancja
+    analytics = get_analytics('grid_bot')      # osobna instancja
 """
 
 import sqlite3
@@ -27,13 +27,13 @@ from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #   PER-BOT KONFIGURACJA
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 BOT_PROFILES = {
     'scalper': {
-        # Highcap: BTC/ETH/SOL — płynne, małe spready, szybkie ruchy
+        # Highcap: BTC/ETH/SOL â€” pÅ‚ynne, maÅ‚e spready, szybkie ruchy
         'vol_ratio_good':         2.5,
         'vol_ratio_bad':          5.0,
         'atr_min':                0.003,
@@ -53,7 +53,7 @@ BOT_PROFILES = {
         'ml_threshold_l4':        0.58,
     },
     'lowcap': {
-        # Lowcap: małe tokeny — duże spready, silne pumpy, szybkie SL
+        # Lowcap: maÅ‚e tokeny â€” duÅ¼e spready, silne ruchy grid, szybkie SL
         'vol_ratio_good':         4.0,
         'vol_ratio_bad':          15.0,
         'atr_min':                0.008,
@@ -72,8 +72,8 @@ BOT_PROFILES = {
         'ml_threshold_l3':        0.57,
         'ml_threshold_l4':        0.60,
     },
-    'pump': {
-        # Pump: momentum — bardzo duże spready, krótkie okna, high risk
+    'grid_bot': {
+        # grid_bot: momentum â€” bardzo duÅ¼e spready, krÃ³tkie okna, high risk
         'vol_ratio_good':         6.0,
         'vol_ratio_bad':          30.0,
         'atr_min':                0.015,
@@ -102,9 +102,9 @@ FEATURE_COLS = [
 ]
 
 
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #   DATA CLASSES
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @dataclass
 class TradeRecord:
@@ -155,9 +155,9 @@ class ParameterAdjustment:
     confidence: float
 
 
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #   DATABASE
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TradeDatabase:
     def __init__(self, db_path: str):
@@ -236,9 +236,9 @@ class TradeDatabase:
             ).fetchone()[0]
 
 
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #   RULE ENGINE (Poziom 1)
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class RuleEngine:
     def __init__(self, bot: str):
@@ -258,16 +258,16 @@ class RuleEngine:
         if len(trades) < min_s:
             return adj
 
-        # ── 1. Seria strat z rzędu ──
+        # â”€â”€ 1. Seria strat z rzÄ™du â”€â”€
         recent_losses = sum(1 for t in trades[:5] if t['win'] == 0)
         if recent_losses >= p['consecutive_loss_block']:
             adj.trading_blocked = True
             adj.block_reason = (
-                f"⛔ ML [{self.bot}]: {recent_losses}/5 strat z rzędu — pauza ochronna"
+                f"â›” ML [{self.bot}]: {recent_losses}/5 strat z rzÄ™du â€” pauza ochronna"
             )
             return adj
 
-        # ── 2. Godzinowy WR ──
+        # â”€â”€ 2. Godzinowy WR â”€â”€
         hour_stats = {}
         for t in trades:
             h = t['hour']
@@ -284,7 +284,7 @@ class RuleEngine:
             elif wr > p['good_hour_wr']:
                 adj.min_score_delta += p['score_boost_good_hour']
 
-        # ── 3. Symbol blacklist / whitelist ──
+        # â”€â”€ 3. Symbol blacklist / whitelist â”€â”€
         sym_stats = {}
         for t in trades:
             s = t['symbol']
@@ -301,14 +301,14 @@ class RuleEngine:
                 elif wr > p['whitelist_wr_threshold']:
                     adj.symbol_whitelist.append(sym)
 
-        # ── 4. BTC kontekst ──
+        # â”€â”€ 4. BTC kontekst â”€â”€
         btc_down = [t for t in trades if t.get('btc_trend') == -1]
         if len(btc_down) >= min_s:
             wr = sum(t['win'] for t in btc_down) / len(btc_down)
             if wr < 0.35:
                 adj.min_score_delta += p['score_penalty_btc_down']
 
-        # ── 5. Vol ratio ──
+        # â”€â”€ 5. Vol ratio â”€â”€
         high_vol = [t for t in trades if (t.get('vol_ratio') or 0) > p['vol_ratio_good']]
         if len(high_vol) >= min_s:
             wr = sum(t['win'] for t in high_vol) / len(high_vol)
@@ -319,9 +319,9 @@ class RuleEngine:
         return adj
 
 
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #   ML PIPELINE (Poziomy 2-4)
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class MLPipeline:
     def __init__(self, bot: str):
@@ -394,7 +394,7 @@ class MLPipeline:
                         X_fit = X
                         use_raw = True
                     except ImportError:
-                        logger.warning(f"[ML:{self.bot}] LightGBM brak — RF fallback")
+                        logger.warning(f"[ML:{self.bot}] LightGBM brak â€” RF fallback")
                         model = RandomForestClassifier(
                             n_estimators=300, max_depth=8,
                             min_samples_leaf=8, class_weight='balanced',
@@ -425,9 +425,9 @@ class MLPipeline:
             )
 
         except ImportError:
-            logger.warning(f"[ML:{self.bot}] sklearn brak — pip install scikit-learn")
+            logger.warning(f"[ML:{self.bot}] sklearn brak â€” pip install scikit-learn")
         except Exception as e:
-            logger.error(f"[ML:{self.bot}] Błąd trenowania: {e}")
+            logger.error(f"[ML:{self.bot}] BÅ‚Ä…d trenowania: {e}")
 
     def predict(self, features: dict, level: int) -> tuple:
         if self.model is None or level < 2:
@@ -449,7 +449,7 @@ class MLPipeline:
             return win_prob >= threshold, win_prob
 
         except Exception as e:
-            logger.error(f"[ML:{self.bot}] Błąd predykcji: {e}")
+            logger.error(f"[ML:{self.bot}] BÅ‚Ä…d predykcji: {e}")
             return True, 0.5
 
     def get_feature_importance(self) -> dict:
@@ -469,14 +469,14 @@ class MLPipeline:
             return {}
 
 
-# ═══════════════════════════════════════════════════════
-#   ANALYTICS ENGINE — jedna instancja per bot
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#   ANALYTICS ENGINE â€” jedna instancja per bot
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class AnalyticsEngine:
     def __init__(self, bot: str):
         self.bot = bot
-        self.db = TradeDatabase(f"analytics_{bot}.db")
+        self.db = TradeDatabase(f"analytics/analytics_{bot}.db")
         self.rule_engine = RuleEngine(bot)
         self.ml_pipeline = MLPipeline(bot)
         self._adjustment = self._empty_adj()
@@ -486,7 +486,7 @@ class AnalyticsEngine:
         self._start_background()
         logger.info(f"[Analytics:{bot}] Uruchomiony")
 
-    # ── ENTRY ──
+    # â”€â”€ ENTRY â”€â”€
 
     def on_entry(self, symbol: str, entry_price: float,
                  stake: float, sl_pct: float, tp1_pct: float,
@@ -526,7 +526,7 @@ class AnalyticsEngine:
             confidence=confidence, ml_level=level, trade_count=count,
         )
 
-    # ── EXIT ──
+    # â”€â”€ EXIT â”€â”€
 
     def on_exit(self, trade_id: str, exit_reason: str, pnl: float, pnl_pct: float):
         with self._lock:
@@ -545,7 +545,7 @@ class AnalyticsEngine:
             self._retrain_counter = 0
             self._trigger_retrain()
 
-    # ── INTERFEJS DLA SILNIKÓW ──
+    # â”€â”€ INTERFEJS DLA SILNIKÃ“W â”€â”€
 
     def is_symbol_blocked(self, symbol: str) -> bool:
         return symbol in self._adjustment.symbol_blacklist
@@ -563,7 +563,7 @@ class AnalyticsEngine:
     def get_preferred_symbols(self) -> list:
         return self._adjustment.symbol_whitelist
 
-    # ── DASHBOARD ──
+    # â”€â”€ DASHBOARD â”€â”€
 
     def get_dashboard_data(self) -> dict:
         trades = self.db.get_trades(limit=1000)
@@ -645,7 +645,7 @@ class AnalyticsEngine:
             },
         }
 
-    # ── WEWNĘTRZNE ──
+    # â”€â”€ WEWNÄ˜TRZNE â”€â”€
 
     def _refresh(self):
         trades = self.db.get_trades(limit=500)
@@ -671,8 +671,8 @@ class AnalyticsEngine:
             while True:
                 try:
                     self._refresh()
-                except Exception as e:
-                    logger.error(f"[Analytics:{self.bot}] {e}")
+                except Exception:
+                    pass
                 time.sleep(300)
         threading.Thread(target=_loop, daemon=True, name=f"analytics-bg-{self.bot}").start()
 
@@ -704,9 +704,9 @@ class AnalyticsEngine:
         }
 
 
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #   SINGLETON PER BOT
-# ═══════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 _instances: dict = {}
 _instances_lock = threading.Lock()
@@ -714,13 +714,13 @@ _instances_lock = threading.Lock()
 
 def get_analytics(bot: str) -> AnalyticsEngine:
     """
-    Zwraca osobną instancję AnalyticsEngine dla każdego bota.
-    Każdy bot ma własną bazę danych i modele ML.
+    Zwraca osobnÄ… instancjÄ™ AnalyticsEngine dla kaÅ¼dego bota.
+    KaÅ¼dy bot ma wÅ‚asnÄ… bazÄ™ danych i modele ML.
 
-    Użycie:
+    UÅ¼ycie:
         analytics = get_analytics('scalper')
         analytics = get_analytics('lowcap')
-        analytics = get_analytics('pump')
+        analytics = get_analytics('grid_bot')
     """
     with _instances_lock:
         if bot not in _instances:
@@ -731,5 +731,5 @@ def get_analytics(bot: str) -> AnalyticsEngine:
 
 
 def get_all_analytics() -> dict:
-    """Zwraca słownik wszystkich aktywnych instancji."""
+    """Zwraca sÅ‚ownik wszystkich aktywnych instancji."""
     return dict(_instances)
