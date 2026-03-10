@@ -1,0 +1,13 @@
+{
+  "stake_usd": 5.0,
+  "max_slots": 3,
+  "buy_drop_min_pct": 0.01,
+  "buy_drop_max_pct": 0.03,
+  "sell_rise_min_pct": 0.01,
+  "sell_rise_max_pct": 0.03,
+  "trailing_enabled": true,
+  "trailing_pct": 0.007,
+  "stop_loss_enabled": true,
+  "stop_loss_pct": 0.07,
+  "max_orders_per_pair": 2
+}

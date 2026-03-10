@@ -2,5 +2,3 @@ vault.py
 .env
 __pycache__/
 *.pyc
-*.db
-*_settings.json
