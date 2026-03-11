@@ -160,7 +160,7 @@ def get_total_exposure(engines: list) -> float:
     return total
 
 def get_total_equity(engines: list) -> float:
-    return wallet.get_balance("USDT") + get_total_exposure(engines)
+    return wallet.get_total("USDT") + get_total_exposure(engines)
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #   SETTINGS DB
@@ -174,8 +174,11 @@ SETTINGS_DEFAULTS = {
     "scalper": {
         "stake_usd": 25.0, "max_slots": 2,
         "target_profit_pct": 0.0035, "stop_loss_pct": 0.0020, "trailing_stop_pct": 0.0015,
-        "maker_fee": 0.0008, "max_trades_day": 400, "daily_loss_limit_pct": 0.05,
-        "max_position_time_sec": 120.0, "min_signal_strength": 0.35,
+        "maker_fee": 0.001, "taker_fee": 0.001, "runner_trail_pct": 0.0010,
+        "reinvest_enabled": False, "reinvest_max_stake": 0.10,
+        "stake_max_cap_usdt": 100.0, "base_stake_usdt": 50.0,
+        "max_trades_day": 400, "daily_loss_limit_pct": 0.05,
+        "min_signal_strength": 0.35,
         "symbol_cooldown_sec": 0.5, "momentum_min_change": 0.002,
         "volume_spike_mult": 1.8, "atr_filter_min": 0.0025,
         "pullback_min_retrace": 0.25, "pullback_max_retrace": 0.40,
@@ -206,7 +209,13 @@ def init_settings_db():
 
 def _scalper_defaults_dict() -> dict:
     d = SETTINGS_DEFAULTS["scalper"]
-    return {k: (int(v) if isinstance(v, int) else float(v)) for k, v in d.items()}
+    def _cast(v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return int(v)
+        return float(v)
+    return {k: _cast(v) for k, v in d.items()}
 
 def init_scalper_settings_file():
     if os.path.exists(SCALPER_SETTINGS_FILE):
@@ -286,8 +295,14 @@ def load_scalper_settings_file() -> dict:
             defaults[k] = v
     try:
         _int_keys = {"max_slots", "max_trades_day", "trend_ema_period"}
+        _bool_keys = {"reinvest_enabled"}
         for k in defaults:
-            defaults[k] = int(defaults[k]) if k in _int_keys else float(defaults[k])
+            if k in _bool_keys:
+                defaults[k] = bool(defaults[k])
+            elif k in _int_keys:
+                defaults[k] = int(defaults[k])
+            else:
+                defaults[k] = float(defaults[k])
     except Exception:
         return _scalper_defaults_dict()
     return defaults
@@ -392,11 +407,13 @@ def apply_settings_to_engines(settings: dict):
         # Risk
         _float_keys = [
             "target_profit_pct", "stop_loss_pct", "trailing_stop_pct", "maker_fee",
-            "daily_loss_limit_pct", "max_position_time_sec", "min_signal_strength",
+            "taker_fee", "runner_trail_pct",
+            "daily_loss_limit_pct", "min_signal_strength",
             "symbol_cooldown_sec", "momentum_min_change", "volume_spike_mult",
             "atr_filter_min", "pullback_min_retrace", "pullback_max_retrace",
             "impulse_ttl_sec", "momentum_window_sec", "volume_baseline_window_sec",
             "trend_window_sec",
+            "reinvest_max_stake", "stake_max_cap_usdt", "base_stake_usdt",
         ]
         for key in _float_keys:
             if key in s:
@@ -405,6 +422,10 @@ def apply_settings_to_engines(settings: dict):
         for key in _int_keys:
             if key in s:
                 setattr(scalper_engine.cfg, key, int(s[key]))
+        _bool_keys = ["reinvest_enabled"]
+        for key in _bool_keys:
+            if key in s:
+                setattr(scalper_engine.cfg, key, bool(s[key]))
         scalper_engine.apply_cfg_globals()
         print(
             f"[WebConfig] scalper settings applied: stake={scalper_engine.cfg.max_stake_usd}"
@@ -412,6 +433,7 @@ def apply_settings_to_engines(settings: dict):
             f" TP={scalper_engine.cfg.target_profit_pct}"
             f" SL={scalper_engine.cfg.stop_loss_pct}"
             f" Trail={scalper_engine.cfg.trailing_stop_pct}"
+            f" Runner={scalper_engine.cfg.runner_trail_pct}"
             f" Strength={scalper_engine.cfg.min_signal_strength}",
             flush=True,
         )
@@ -561,11 +583,13 @@ def init_engines():
     scalper_cfg.max_open_positions   = scalper_cfg.slot_count
     _float_cfg_keys = [
         "target_profit_pct", "stop_loss_pct", "trailing_stop_pct", "maker_fee",
+        "taker_fee", "runner_trail_pct",
         "daily_loss_limit_pct", "max_position_time_sec", "min_signal_strength",
         "symbol_cooldown_sec", "momentum_min_change", "volume_spike_mult",
         "atr_filter_min", "pullback_min_retrace", "pullback_max_retrace",
         "impulse_ttl_sec", "momentum_window_sec", "volume_baseline_window_sec",
         "trend_window_sec",
+        "reinvest_max_stake", "stake_max_cap_usdt", "base_stake_usdt",
     ]
     for key in _float_cfg_keys:
         if key in loaded_scalper:
@@ -573,6 +597,8 @@ def init_engines():
     for key in ["max_trades_day", "trend_ema_period"]:
         if key in loaded_scalper:
             setattr(scalper_cfg, key, int(loaded_scalper[key]))
+    if "reinvest_enabled" in loaded_scalper:
+        scalper_cfg.reinvest_enabled = bool(loaded_scalper["reinvest_enabled"])
 
     scalper_engine = ScalperEngine(
         scalper_cfg,
@@ -699,9 +725,12 @@ async def stop_bot(bot: str, user=Depends(verify_token)):
 def get_portfolio(user=Depends(verify_token)):
     engines = [e for e in [scalper_engine, lowcap_engine, grid_bot_engine] if e]
     exposure = get_total_exposure(engines)
-    equity   = get_total_equity(engines)
+    # Use get_total (not get_balance) because paper trades already modify the
+    # total via apply_trade.  get_balance subtracts reserved again → double-counting.
+    available = wallet.get_total("USDT")
+    equity = available + exposure
     return {
-        "balance_usdt":   round(wallet.get_balance("USDT"), 2),
+        "balance_usdt":   round(available, 2),
         "total_exposure": round(exposure, 2),
         "total_equity":   round(equity, 2),
         "start_balance":  round(wallet.start_balance, 2),
@@ -718,9 +747,14 @@ class SettingsRequest(BaseModel):
     stop_loss_pct: Optional[float] = None
     trailing_stop_pct: Optional[float] = None
     maker_fee: Optional[float] = None
+    taker_fee: Optional[float] = None
+    runner_trail_pct: Optional[float] = None
+    reinvest_enabled: Optional[bool] = None
+    reinvest_max_stake: Optional[float] = None
+    stake_max_cap_usdt: Optional[float] = None
+    base_stake_usdt: Optional[float] = None
     max_trades_day: Optional[int] = None
     daily_loss_limit_pct: Optional[float] = None
-    max_position_time_sec: Optional[float] = None
     min_signal_strength: Optional[float] = None
     symbol_cooldown_sec: Optional[float] = None
     momentum_min_change: Optional[float] = None
@@ -768,11 +802,13 @@ async def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_to
         # Merge all optional scalper fields from request
         _scalper_opt_float = [
             "target_profit_pct", "stop_loss_pct", "trailing_stop_pct", "maker_fee",
-            "daily_loss_limit_pct", "max_position_time_sec", "min_signal_strength",
+            "taker_fee", "runner_trail_pct",
+            "daily_loss_limit_pct", "min_signal_strength",
             "symbol_cooldown_sec", "momentum_min_change", "volume_spike_mult",
             "atr_filter_min", "pullback_min_retrace", "pullback_max_retrace",
             "impulse_ttl_sec", "momentum_window_sec", "volume_baseline_window_sec",
             "trend_window_sec",
+            "reinvest_max_stake", "stake_max_cap_usdt", "base_stake_usdt",
         ]
         for key in _scalper_opt_float:
             val = getattr(req, key, None)
@@ -782,6 +818,8 @@ async def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_to
             val = getattr(req, key, None)
             if val is not None:
                 payload[key] = int(val)
+        if req.reinvest_enabled is not None:
+            payload["reinvest_enabled"] = bool(req.reinvest_enabled)
         # Basic validation
         if payload.get("target_profit_pct", 0) <= 0:
             raise HTTPException(400, "target_profit_pct musi byc > 0")
@@ -865,6 +903,13 @@ async def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_to
     save_setting_db("grid_bot", payload["stake_usd"], payload["max_slots"])
     apply_settings_to_engines({"grid_bot": payload})
     return {"ok": True}
+
+@app.get("/api/scalper/profit")
+def get_scalper_profit(user=Depends(verify_token)):
+    if not scalper_engine:
+        return {"bot": "scalper", "session_profit": 0, "realized_profit": 0,
+                "daily_profit": 0, "wins": 0, "losses": 0, "win_rate": 0, "effective_stake": 0}
+    return scalper_engine.bot_profit_summary
 
 @app.get("/api/analytics")
 def get_analytics_data(bot: str = "scalper", user=Depends(verify_token)):

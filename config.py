@@ -48,13 +48,14 @@ class ScalperConfig:
     # ── Trading params (real defaults in main_web.py, set on startup) ──
     slot_count: int = 0
     max_stake_usd: float = 0.0
-    maker_fee: float = 0.0
+    maker_fee: float = 0.001
+    taker_fee: float = 0.001
     target_profit_pct: float = 0.0
     stop_loss_pct: float = 0.0
     trailing_stop_pct: float = 0.0
+    runner_trail_pct: float = 0.0010
     max_trades_day: int = 0
     daily_loss_limit_pct: float = 0.0
-    max_position_time_sec: float = 0.0
     min_signal_strength: float = 0.0
     symbol_cooldown_sec: float = 0.0
     momentum_min_change: float = 0.0
@@ -67,6 +68,12 @@ class ScalperConfig:
     volume_baseline_window_sec: float = 0.0
     trend_ema_period: int = 0
     trend_window_sec: float = 0.0
+
+    # ── Reinvest ──
+    reinvest_enabled: bool = False
+    reinvest_max_stake: float = 0.10
+    stake_max_cap_usdt: float = 100.0
+    base_stake_usdt: float = 50.0
 
     # ── Infrastructure (not exposed in web) ──
     max_position_size_usdt: float = 10.0
@@ -138,7 +145,7 @@ class LowcapConfig:
     stop_loss_enabled: bool = True
     stop_loss_pct: float = 0.07         # 5%-10% optional stop loss
     entry_cooldown_s: float = 5.0
-    maker_fee: float = 0.0008
+    maker_fee: float = 0.001
 
     # Daily circuit breaker
     daily_loss_limit_usdt: float = 3.0
@@ -183,8 +190,8 @@ class GridBotConfig:
 
     # Exit
     sell_above_buy_pct: float = 0.006  # sell at buy * (1 + 2*this + maker_fee)
-    maker_fee: float = 0.0008
-    taker_fee: float = 0.002
+    maker_fee: float = 0.001
+    taker_fee: float = 0.001
 
     # Grid management
     rebalance_interval_s: float = 1800.0   # rebuild grid every 30 min

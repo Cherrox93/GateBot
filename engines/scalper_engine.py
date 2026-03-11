@@ -38,6 +38,7 @@ from paper_execution import PaperExecution
 _DEFAULT_SCALPER_CFG = ScalperConfig()
 
 MAKER_FEE: float = _DEFAULT_SCALPER_CFG.maker_fee
+TAKER_FEE: float = _DEFAULT_SCALPER_CFG.taker_fee
 MAX_TRADES_DAY: int = _DEFAULT_SCALPER_CFG.max_trades_day
 SYMBOLS: list[str] = [s.replace("/", "_") for s in _DEFAULT_SCALPER_CFG.gigants]
 PAIR_REFRESH_SEC: float = _DEFAULT_SCALPER_CFG.pair_refresh_sec
@@ -51,7 +52,6 @@ MISSED_RETRY_COOLDOWN_SEC: float = _DEFAULT_SCALPER_CFG.missed_retry_cooldown_se
 TARGET_PROFIT_PCT: float = _DEFAULT_SCALPER_CFG.target_profit_pct
 STOP_LOSS_PCT: float = _DEFAULT_SCALPER_CFG.stop_loss_pct
 TRAILING_STOP_PCT: float = _DEFAULT_SCALPER_CFG.trailing_stop_pct
-MAX_POSITION_TIME_SEC: float = _DEFAULT_SCALPER_CFG.max_position_time_sec
 SOR_MAKER_WAIT_MS: int = _DEFAULT_SCALPER_CFG.sor_maker_wait_ms
 SOR_AGGR_WAIT_MS: int = _DEFAULT_SCALPER_CFG.sor_aggressive_wait_ms
 
@@ -542,6 +542,8 @@ class ExecutionEngine:
     Uses sync ccxt via run_in_executor (Windows compatible).
     """
 
+    RUNNER_TRAIL_PCT: float = 0.0010
+
     def __init__(
         self,
         exchange: ccxt.Exchange,
@@ -721,19 +723,29 @@ class ExecutionEngine:
         peak_net_pnl = 0.0
         _last_pos_broadcast = 0.0
         # MFE/MAE tracking (gross pnl extremes)
-        _max_favorable = 0.0  # best gross_pnl seen
-        _max_adverse = 0.0    # worst gross_pnl seen (stored as positive value)
+        _max_favorable = 0.0
+        _max_adverse = 0.0
+        # Runner state
+        runner_active: bool = False
+        runner_sl: float = 0.0
+        runner_peak: float = 0.0
+        # Fee estimate for net_pnl calc (entry maker + exit taker)
+        TOTAL_FEE = MAKER_FEE + TAKER_FEE
 
         while True:
+            # a) sleep
             await asyncio.sleep(MONITOR_POLL_SEC)
             now = time.time()
+
+            # b) current price
             current = await self._last_price(ccxt_sym, pos.entry_price)
 
-            # Broadcast position update every ~1s for live web display
+            # c) broadcast position update every ~1s
             if self.position_callback and now - _last_pos_broadcast >= 1.0:
                 _last_pos_broadcast = now
                 self.position_callback(pos.symbol, pos.entry_price, current, pos.sl_price, pos.tp_price)
 
+            # d) check TP_MAKER order fill
             if pos.tp_order_id:
                 try:
                     tp = await self._call(self.exchange.fetch_order, pos.tp_order_id, ccxt_sym)
@@ -744,39 +756,59 @@ class ExecutionEngine:
                 except Exception:
                     pass
 
+            # e) calc gross_pnl and net_pnl
             gross_pnl = (current / pos.entry_price - 1.0) * pos.direction
+            net_pnl = gross_pnl - TOTAL_FEE
 
-            # Track MFE/MAE
+            # Track MFE/MAE (gross)
             if gross_pnl > _max_favorable:
                 _max_favorable = gross_pnl
             if gross_pnl < 0 and abs(gross_pnl) > _max_adverse:
                 _max_adverse = abs(gross_pnl)
 
-            # TP/SL triggers use gross price movement (no fee adjustment)
-            # Fees are only deducted in final PnL display/logging
-            if gross_pnl >= TARGET_PROFIT_PCT:
-                if pos.tp_order_id:
-                    await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                exit_price = await self._market_sell(pos, ccxt_sym)
-                exit_reason = "TP"
-                break
+            # f) RUNNER block — if runner already active
+            if runner_active:
+                runner_peak = max(runner_peak, current)
+                runner_trail_sl = runner_peak * (1.0 - self.RUNNER_TRAIL_PCT)
+                effective_sl = max(runner_sl, runner_trail_sl)
+                if current <= effective_sl:
+                    if pos.tp_order_id:
+                        await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
+                    exit_price = await self._market_sell(pos, ccxt_sym)
+                    exit_reason = "RUNNER"
+                    break
+                continue  # runner active — skip other checks
 
-            # Trailing stop: track gross peak and exit on retrace
-            if TRAILING_STOP_PCT > 0 and gross_pnl > 0:
-                peak_net_pnl = max(peak_net_pnl, gross_pnl)
-                if peak_net_pnl - gross_pnl >= TRAILING_STOP_PCT:
+            # g) RUNNER activation — gross profit minus fees covers target
+            if gross_pnl - TOTAL_FEE >= TARGET_PROFIT_PCT:
+                runner_active = True
+                runner_sl = pos.tp_price
+                runner_peak = current
+                print(
+                    f"[{pos.symbol}] RUNNER aktywny peak={current:.6f}"
+                    f" sl_lock={pos.tp_price:.6f}",
+                    flush=True,
+                )
+                continue  # don't sell, go to next iteration
+
+            # h) Trailing stop — only when net_pnl > 0 and TRAILING enabled
+            if TRAILING_STOP_PCT > 0 and net_pnl > 0:
+                peak_net_pnl = max(peak_net_pnl, net_pnl)
+                if peak_net_pnl - net_pnl >= TRAILING_STOP_PCT:
                     if pos.tp_order_id:
                         await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
                     exit_price = await self._market_sell(pos, ccxt_sym)
                     exit_reason = "TRAIL"
                     break
 
+            # i) SL check — uses gross (no fee in trigger)
             if gross_pnl <= -STOP_LOSS_PCT:
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
                 exit_price = await self._market_sell(pos, ccxt_sym)
                 exit_reason = "SL"
                 break
+
 
         return self._build_result(pos, exit_price, exit_reason, fill_latency_sec,
                                   mfe=_max_favorable, mae=_max_adverse)
@@ -792,7 +824,7 @@ class ExecutionEngine:
     ) -> TradeResult:
         raw_pnl = (exit_price / pos.entry_price - 1) * pos.direction * pos.stake
         entry_fee = pos.stake * MAKER_FEE
-        exit_fee = pos.stake * MAKER_FEE * (1.0 if exit_reason == "TP_MAKER" else 1.25)
+        exit_fee = pos.stake * (MAKER_FEE if exit_reason == "TP_MAKER" else TAKER_FEE)
         return TradeResult(
             symbol=pos.symbol, direction=pos.direction, strategy=pos.strategy,
             entry_price=pos.entry_price, exit_price=exit_price,
@@ -829,14 +861,15 @@ class ScalperEngine:
         tg=None,
         portfolio=None,
     ) -> None:
-        global MAKER_FEE, MAX_TRADES_DAY, PAIR_REFRESH_SEC
+        global MAKER_FEE, TAKER_FEE, MAX_TRADES_DAY, PAIR_REFRESH_SEC
         global WS_RECONNECT_MAX, WS_RECONNECT_BASE, EXCHANGE_TIMEOUT_SEC
         global MONITOR_POLL_SEC, MISSED_RETRY_COOLDOWN_SEC
-        global TARGET_PROFIT_PCT, STOP_LOSS_PCT, TRAILING_STOP_PCT, MAX_POSITION_TIME_SEC
+        global TARGET_PROFIT_PCT, STOP_LOSS_PCT, TRAILING_STOP_PCT
         global SOR_MAKER_WAIT_MS, SOR_AGGR_WAIT_MS
 
         self.cfg = cfg
         MAKER_FEE = float(self.cfg.maker_fee)
+        TAKER_FEE = float(self.cfg.taker_fee)
         MAX_TRADES_DAY = int(self.cfg.max_trades_day)
         PAIR_REFRESH_SEC = float(self.cfg.pair_refresh_sec)
         WS_RECONNECT_MAX = int(self.cfg.ws_reconnect_max)
@@ -847,7 +880,6 @@ class ScalperEngine:
         TARGET_PROFIT_PCT = float(self.cfg.target_profit_pct)
         STOP_LOSS_PCT = float(self.cfg.stop_loss_pct)
         TRAILING_STOP_PCT = float(self.cfg.trailing_stop_pct)
-        MAX_POSITION_TIME_SEC = float(self.cfg.max_position_time_sec)
         SOR_MAKER_WAIT_MS = int(self.cfg.sor_maker_wait_ms)
         SOR_AGGR_WAIT_MS = int(self.cfg.sor_aggressive_wait_ms)
 
@@ -909,6 +941,7 @@ class ScalperEngine:
         self.balance_usdt = cfg.start_balance
         self.realized_profit = 0.0
         self.daily_realized = 0.0
+        self.session_profit: float = 0.0
         self._day_start = datetime.now().date()
         self.wins = 0
         self.losses = 0
@@ -920,14 +953,16 @@ class ScalperEngine:
     def apply_cfg_globals(self) -> None:
         """Propagate cfg values to module-level globals and instance vars."""
         global TARGET_PROFIT_PCT, STOP_LOSS_PCT, TRAILING_STOP_PCT
-        global MAKER_FEE, MAX_TRADES_DAY, MAX_POSITION_TIME_SEC
+        global MAKER_FEE, TAKER_FEE, MAX_TRADES_DAY
         _old_tp, _old_sl = TARGET_PROFIT_PCT, STOP_LOSS_PCT
         TARGET_PROFIT_PCT = float(self.cfg.target_profit_pct)
         STOP_LOSS_PCT = float(self.cfg.stop_loss_pct)
         TRAILING_STOP_PCT = float(self.cfg.trailing_stop_pct)
         MAKER_FEE = float(self.cfg.maker_fee)
+        TAKER_FEE = float(self.cfg.taker_fee)
         MAX_TRADES_DAY = int(self.cfg.max_trades_day)
-        MAX_POSITION_TIME_SEC = float(self.cfg.max_position_time_sec)
+        # Sync Runner trail to executor
+        self._executor.RUNNER_TRAIL_PCT = float(self.cfg.runner_trail_pct)
         # Sync instance vars set from cfg in __init__
         self.symbol_cooldown_sec = float(self.cfg.symbol_cooldown_sec)
         self.max_position_size_usdt = float(self.cfg.max_position_size_usdt)
@@ -937,7 +972,7 @@ class ScalperEngine:
             print(
                 f"[ScalperCfg] globals synced: TP {_old_tp}->{TARGET_PROFIT_PCT}"
                 f" SL {_old_sl}->{STOP_LOSS_PCT}"
-                f" Trail={TRAILING_STOP_PCT} MaxTime={MAX_POSITION_TIME_SEC}",
+                f" Trail={TRAILING_STOP_PCT} Runner={self._executor.RUNNER_TRAIL_PCT}",
                 flush=True,
             )
 
@@ -947,6 +982,31 @@ class ScalperEngine:
     def active_positions(self) -> dict:
         """Dict of {symbol: {"stake": x, "original_stake": x}} for portfolio calc."""
         return self._state.as_dict()
+
+    @property
+    def bot_profit_summary(self) -> dict:
+        total = self.wins + self.losses
+        return {
+            "bot": "scalper",
+            "session_profit": round(self.session_profit, 4),
+            "realized_profit": round(self.realized_profit, 4),
+            "daily_profit": round(self.daily_realized, 4),
+            "wins": self.wins,
+            "losses": self.losses,
+            "win_rate": round(self.wins / max(total, 1) * 100, 1),
+            "effective_stake": self._calc_effective_stake(),
+        }
+
+    def _calc_effective_stake(self) -> float:
+        """Effective stake with optional reinvest from session profit."""
+        if not self.cfg.reinvest_enabled:
+            return float(self.cfg.base_stake_usdt)
+        reinvest_pool = max(self.session_profit, 0.0) * float(self.cfg.reinvest_max_stake)
+        open_slots = max(self._state.count(), 1)
+        reinvest_per_slot = reinvest_pool / open_slots
+        effective = float(self.cfg.base_stake_usdt) + reinvest_per_slot
+        effective = min(effective, float(self.cfg.stake_max_cap_usdt))
+        return round(effective, 2)
 
     # ── Logging (same pattern as other engines) ──────────────────────────────
 
@@ -1654,8 +1714,9 @@ class ScalperEngine:
                 continue
 
             balance_now = self.portfolio.get_balance("USDT") if self.portfolio else self.balance_usdt
-            stake_limit = float(getattr(self.cfg, "max_stake_usd", self.cfg.max_position_size_usdt))
-            stake = min(stake_limit, balance_now)
+            stake = self._calc_effective_stake()
+            if balance_now < stake:
+                stake = balance_now
             if stake <= 0:
                 continue
             max_pos = int(getattr(self.cfg, "slot_count", self.cfg.max_open_positions))
@@ -1820,6 +1881,7 @@ class ScalperEngine:
 
         self.realized_profit += net_pnl
         self.daily_realized  += net_pnl
+        self.session_profit  += net_pnl
         if net_pnl >= 0:
             self.wins += 1
         else:

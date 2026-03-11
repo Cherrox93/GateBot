@@ -671,16 +671,16 @@
 
           <div style="color:#555;font-size:10px;letter-spacing:1px;margin:8px 0 4px;border-bottom:1px solid #222;padding-bottom:3px">KAPITAL</div>
           <div class="settings-field">
-            <label>STAWKA (USD)</label>
+            <label>STAKE (USD)</label>
             <input type="number" id="cfg-scalper-stake" step="1" min="1">
+          </div>
+          <div class="settings-field">
+            <label>MAKS. STAKE (USD)</label>
+            <input type="number" id="cfg-scalper-max-cap" step="1" min="1">
           </div>
           <div class="settings-field">
             <label>MAKS. SLOTY</label>
             <input type="number" id="cfg-scalper-slots" step="1" min="1" max="10">
-          </div>
-          <div class="settings-field">
-            <label>MAKER FEE %</label>
-            <input type="number" id="cfg-scalper-fee" step="0.001" min="0">
           </div>
 
           <div style="color:#555;font-size:10px;letter-spacing:1px;margin:8px 0 4px;border-bottom:1px solid #222;padding-bottom:3px">RYZYKO</div>
@@ -693,16 +693,12 @@
             <input type="number" id="cfg-scalper-sl" step="0.01" min="0.01" max="10">
           </div>
           <div class="settings-field">
-            <label>TRAILING STOP %</label>
-            <input type="number" id="cfg-scalper-trail" step="0.01" min="0" max="10">
+            <label>RUNNER TRAILING %</label>
+            <input type="number" id="cfg-scalper-runner" step="0.01" min="0.01" max="5">
           </div>
           <div class="settings-field">
             <label>DZIENNY LIMIT STRAT %</label>
             <input type="number" id="cfg-scalper-daily-loss" step="0.1" min="0.1" max="50">
-          </div>
-          <div class="settings-field">
-            <label>MAKS. CZAS POZYCJI (s)</label>
-            <input type="number" id="cfg-scalper-max-time" step="1" min="1">
           </div>
           <div class="settings-field">
             <label>MAKS. TRANSAKCJI/DZIEN</label>
@@ -761,6 +757,16 @@
           <div class="settings-field">
             <label>TREND OKNO (s)</label>
             <input type="number" id="cfg-scalper-trend-window" step="1" min="1">
+          </div>
+
+          <div style="color:#555;font-size:10px;letter-spacing:1px;margin:8px 0 4px;border-bottom:1px solid #222;padding-bottom:3px">REINVEST</div>
+          <div class="settings-field" style="display:flex;align-items:center;gap:8px">
+            <label style="flex:1">AUTO REINVEST</label>
+            <input type="checkbox" id="cfg-scalper-reinvest" style="width:18px;height:18px">
+          </div>
+          <div class="settings-field">
+            <label>REINVEST % ZYSKU</label>
+            <input type="number" id="cfg-scalper-reinvest-pct" step="1" min="0" max="100">
           </div>
 
           <button class="btn-save" onclick="saveSetting('scalper')">ZAPISZ</button>
@@ -1409,15 +1415,13 @@ async function fetchPortfolio() {
 const SCALPER_FIELDS = [
   {id:'cfg-scalper-tp',           key:'target_profit_pct',       pct:true},
   {id:'cfg-scalper-sl',           key:'stop_loss_pct',           pct:true},
-  {id:'cfg-scalper-trail',        key:'trailing_stop_pct',       pct:true},
-  {id:'cfg-scalper-fee',          key:'maker_fee',               pct:true},
+  {id:'cfg-scalper-runner',       key:'runner_trail_pct',        pct:true},
   {id:'cfg-scalper-daily-loss',   key:'daily_loss_limit_pct',    pct:true},
   {id:'cfg-scalper-momentum',     key:'momentum_min_change',     pct:true},
   {id:'cfg-scalper-atr',          key:'atr_filter_min',          pct:true},
   {id:'cfg-scalper-pb-min',       key:'pullback_min_retrace',    pct:true},
   {id:'cfg-scalper-pb-max',       key:'pullback_max_retrace',    pct:true},
   {id:'cfg-scalper-max-trades',   key:'max_trades_day',          int:true},
-  {id:'cfg-scalper-max-time',     key:'max_position_time_sec'},
   {id:'cfg-scalper-strength',     key:'min_signal_strength'},
   {id:'cfg-scalper-cooldown',     key:'symbol_cooldown_sec'},
   {id:'cfg-scalper-vol-mult',     key:'volume_spike_mult'},
@@ -1426,6 +1430,8 @@ const SCALPER_FIELDS = [
   {id:'cfg-scalper-vol-window',   key:'volume_baseline_window_sec'},
   {id:'cfg-scalper-trend-ema',    key:'trend_ema_period',        int:true},
   {id:'cfg-scalper-trend-window', key:'trend_window_sec'},
+  {id:'cfg-scalper-reinvest-pct', key:'reinvest_max_stake',       pct:true},
+  {id:'cfg-scalper-max-cap',      key:'stake_max_cap_usdt'},
 ];
 
 async function loadSettings() {
@@ -1446,6 +1452,9 @@ async function loadSettings() {
     if (!el || sc[f.key] === undefined) return;
     el.value = f.pct ? (sc[f.key] * 100).toFixed(2) : (f.int ? sc[f.key] : parseFloat(sc[f.key]).toFixed(2));
   });
+  // Reinvest checkbox
+  const reinvEl = document.getElementById('cfg-scalper-reinvest');
+  if (reinvEl && sc.reinvest_enabled !== undefined) reinvEl.checked = !!sc.reinvest_enabled;
   // Lowcap / Grid
   const lc = data.lowcap || {};
   if (lc.max_orders_per_pair !== undefined) document.getElementById('cfg-lowcap-orders').value = lc.max_orders_per_pair;
@@ -1474,6 +1483,8 @@ async function saveSetting(bot) {
       if (!Number.isFinite(raw)) return;
       payload[f.key] = f.pct ? raw / 100.0 : raw;
     });
+    const reinvEl = document.getElementById('cfg-scalper-reinvest');
+    if (reinvEl) payload.reinvest_enabled = reinvEl.checked;
   }
   if (bot === 'lowcap') {
     const ordersVal = parseInt(document.getElementById('cfg-lowcap-orders').value, 10);
