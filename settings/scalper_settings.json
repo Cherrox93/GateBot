@@ -1,8 +1,8 @@
 {
-  "stake_usd": 20.0,
-  "max_slots": 3,
-  "target_profit_pct": 0.008,
-  "stop_loss_pct": 0.01,
+  "stake_usd": 50.0,
+  "max_slots": 1,
+  "target_profit_pct": 0.0034999999999999996,
+  "stop_loss_pct": 0.0025,
   "trailing_stop_pct": 0.0,
   "maker_fee": 0.0008,
   "max_trades_day": 400,

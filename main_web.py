@@ -406,7 +406,15 @@ def apply_settings_to_engines(settings: dict):
             if key in s:
                 setattr(scalper_engine.cfg, key, int(s[key]))
         scalper_engine.apply_cfg_globals()
-        print(f"[WebConfig] scalper settings updated: stake={scalper_engine.cfg.max_stake_usd} slots={scalper_engine.cfg.slot_count}", flush=True)
+        print(
+            f"[WebConfig] scalper settings applied: stake={scalper_engine.cfg.max_stake_usd}"
+            f" slots={scalper_engine.cfg.slot_count}"
+            f" TP={scalper_engine.cfg.target_profit_pct}"
+            f" SL={scalper_engine.cfg.stop_loss_pct}"
+            f" Trail={scalper_engine.cfg.trailing_stop_pct}"
+            f" Strength={scalper_engine.cfg.min_signal_strength}",
+            flush=True,
+        )
     if lowcap_engine and "lowcap" in settings:
         s = settings["lowcap"]
         lowcap_engine.cfg.position_size        = s["stake_usd"]
@@ -738,7 +746,7 @@ class SettingsRequest(BaseModel):
     max_active_symbols: Optional[int] = None
 
 @app.post("/api/settings/{bot}")
-def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_token)):
+async def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_token)):
     if bot not in ("scalper", "lowcap", "grid_bot"):
         raise HTTPException(404, "Bot nie istnieje")
     if bot == "scalper":

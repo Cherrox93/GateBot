@@ -154,6 +154,8 @@ class TradeResult:
     fill_latency_sec: float
     duration: float
     timestamp: float
+    mfe: float = 0.0        # max favorable excursion (%)
+    mae: float = 0.0        # max adverse excursion (%)
 
 
 # ============================================================
@@ -691,6 +693,8 @@ class ExecutionEngine:
             filled_price = taker_fill
             order_id = "market_fallback"
 
+        # TP/SL prices — exact user settings, no fee adjustment
+        # Fees are only accounted for in PnL display/logging, not in trigger prices
         pos = OpenPosition(
             symbol=signal.symbol, direction=signal.direction,
             entry_price=filled_price,
@@ -700,6 +704,12 @@ class ExecutionEngine:
             entry_time=time.time(), entry_order_id=order_id,
             tp_order_id=None, strategy=signal.strategy,
         )
+        print(
+            f"[{signal.symbol}] OPEN entry={filled_price:.6f}"
+            f" TP={TARGET_PROFIT_PCT:.4f} SL={STOP_LOSS_PCT:.4f}"
+            f" tp_price={pos.tp_price:.6f} sl_price={pos.sl_price:.6f}",
+            flush=True,
+        )
 
         # Retail exit model: take-profit is executed with taker (market) for fill certainty.
         fill_latency = max(time.time() - entry_start, 0.0)
@@ -708,8 +718,11 @@ class ExecutionEngine:
     async def _monitor(self, pos: OpenPosition, ccxt_sym: str, fill_latency_sec: float) -> TradeResult:
         exit_reason = "SL"
         exit_price = pos.entry_price
-        peak_pnl_pct = 0.0
+        peak_net_pnl = 0.0
         _last_pos_broadcast = 0.0
+        # MFE/MAE tracking (gross pnl extremes)
+        _max_favorable = 0.0  # best gross_pnl seen
+        _max_adverse = 0.0    # worst gross_pnl seen (stored as positive value)
 
         while True:
             await asyncio.sleep(MONITOR_POLL_SEC)
@@ -731,36 +744,42 @@ class ExecutionEngine:
                 except Exception:
                     pass
 
-            pnl_pct = (current / pos.entry_price - 1.0) * pos.direction
+            gross_pnl = (current / pos.entry_price - 1.0) * pos.direction
 
-            if pnl_pct >= TARGET_PROFIT_PCT:
+            # Track MFE/MAE
+            if gross_pnl > _max_favorable:
+                _max_favorable = gross_pnl
+            if gross_pnl < 0 and abs(gross_pnl) > _max_adverse:
+                _max_adverse = abs(gross_pnl)
+
+            # TP/SL triggers use gross price movement (no fee adjustment)
+            # Fees are only deducted in final PnL display/logging
+            if gross_pnl >= TARGET_PROFIT_PCT:
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
                 exit_price = await self._market_sell(pos, ccxt_sym)
                 exit_reason = "TP"
                 break
 
-            # Trailing stop: track peak and exit on retrace
-            if TRAILING_STOP_PCT > 0 and pnl_pct > 0:
-                peak_pnl_pct = max(peak_pnl_pct, pnl_pct)
-                if peak_pnl_pct - pnl_pct >= TRAILING_STOP_PCT:
+            # Trailing stop: track gross peak and exit on retrace
+            if TRAILING_STOP_PCT > 0 and gross_pnl > 0:
+                peak_net_pnl = max(peak_net_pnl, gross_pnl)
+                if peak_net_pnl - gross_pnl >= TRAILING_STOP_PCT:
                     if pos.tp_order_id:
                         await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
                     exit_price = await self._market_sell(pos, ccxt_sym)
                     exit_reason = "TRAIL"
                     break
 
-            sl_hit = (
-                pnl_pct <= -STOP_LOSS_PCT
-            )
-            if sl_hit:
+            if gross_pnl <= -STOP_LOSS_PCT:
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
                 exit_price = await self._market_sell(pos, ccxt_sym)
                 exit_reason = "SL"
                 break
 
-        return self._build_result(pos, exit_price, exit_reason, fill_latency_sec)
+        return self._build_result(pos, exit_price, exit_reason, fill_latency_sec,
+                                  mfe=_max_favorable, mae=_max_adverse)
 
     def _build_result(
         self,
@@ -768,6 +787,8 @@ class ExecutionEngine:
         exit_price: float,
         exit_reason: str,
         fill_latency_sec: float,
+        mfe: float = 0.0,
+        mae: float = 0.0,
     ) -> TradeResult:
         raw_pnl = (exit_price / pos.entry_price - 1) * pos.direction * pos.stake
         entry_fee = pos.stake * MAKER_FEE
@@ -778,6 +799,7 @@ class ExecutionEngine:
             stake=pos.stake, pnl_usd=raw_pnl,
             fee_paid=entry_fee + exit_fee, exit_reason=exit_reason, fill_latency_sec=fill_latency_sec,
             duration=time.time() - pos.entry_time, timestamp=time.time(),
+            mfe=mfe, mae=mae,
         )
 
     def _missed(self, signal: Signal, stake: float, reason: str = "") -> TradeResult:
@@ -899,6 +921,7 @@ class ScalperEngine:
         """Propagate cfg values to module-level globals and instance vars."""
         global TARGET_PROFIT_PCT, STOP_LOSS_PCT, TRAILING_STOP_PCT
         global MAKER_FEE, MAX_TRADES_DAY, MAX_POSITION_TIME_SEC
+        _old_tp, _old_sl = TARGET_PROFIT_PCT, STOP_LOSS_PCT
         TARGET_PROFIT_PCT = float(self.cfg.target_profit_pct)
         STOP_LOSS_PCT = float(self.cfg.stop_loss_pct)
         TRAILING_STOP_PCT = float(self.cfg.trailing_stop_pct)
@@ -910,6 +933,13 @@ class ScalperEngine:
         self.max_position_size_usdt = float(self.cfg.max_position_size_usdt)
         self.max_open_positions = int(self.cfg.max_open_positions)
         self._filter.MIN_STRENGTH = float(self.cfg.min_signal_strength)
+        if _old_tp != TARGET_PROFIT_PCT or _old_sl != STOP_LOSS_PCT:
+            print(
+                f"[ScalperCfg] globals synced: TP {_old_tp}->{TARGET_PROFIT_PCT}"
+                f" SL {_old_sl}->{STOP_LOSS_PCT}"
+                f" Trail={TRAILING_STOP_PCT} MaxTime={MAX_POSITION_TIME_SEC}",
+                flush=True,
+            )
 
     # ── Compatibility property for main_web.py ───────────────────────────────
 
@@ -1100,6 +1130,163 @@ class ScalperEngine:
     def _daily_limit_hit(self) -> bool:
         limit = -self.cfg.start_balance * self.cfg.daily_loss_limit_pct
         return self.daily_realized <= limit
+
+    # ── ML Feature Collection (v3) ──────────────────────────────────────────
+
+    def _collect_ml_features(self, symbol: str, signal: Signal,
+                             features: Features, snapshot: MarketSnapshot) -> dict:
+        """Collect full feature set for ML analytics from live market data."""
+        now = time.time()
+        cache = self._cache
+
+        # ── v2 base features (from signal + features) ──
+        f = {
+            'score': round(signal.strength * 100),
+            'vol_ratio': features.volume_spike_ratio,
+            'body_ratio': features.micro_range_pct / 100.0 if features.micro_range_pct > 0 else 0.5,
+            'atr_pct': cache.get_atr_1m_pct(symbol),
+            'upper_wick_ratio': 0.0,
+            'breakout_strength': 1.0 + (features.signal_strength - 0.5) * 0.1,
+            'hour': datetime.now().hour,
+            'day_of_week': datetime.now().weekday(),
+        }
+
+        # EMA slopes
+        ema9 = cache.get_ema(symbol, period=9, window_sec=30.0)
+        ema21 = cache.get_ema(symbol, period=21, window_sec=60.0)
+        price = snapshot.last_price
+        if ema9 and ema21 and price > 0:
+            f['ema9_slope'] = (price - ema9) / price
+            f['ema21_slope'] = (price - ema21) / price
+            f['ema_spread'] = (ema9 - ema21) / price
+        else:
+            f['ema9_slope'] = 0.0
+            f['ema21_slope'] = 0.0
+            f['ema_spread'] = 0.0
+
+        # BTC context
+        btc_ticks = cache.get_price_ticks("BTC_USDT", 60.0)
+        if len(btc_ticks) >= 5:
+            btc_first, btc_last = btc_ticks[0][1], btc_ticks[-1][1]
+            btc_change = (btc_last - btc_first) / btc_first if btc_first > 0 else 0
+            f['btc_trend'] = 1 if btc_change > 0.0005 else (-1 if btc_change < -0.0005 else 0)
+            btc_prices = [p for _, p in btc_ticks]
+            btc_lo = min(btc_prices)
+            f['btc_atr_pct'] = (max(btc_prices) - btc_lo) / btc_lo if btc_lo > 0 else 0
+            btc_vol = cache.get_volume_sum("BTC_USDT", 60.0)
+            btc_vol_base = cache.get_volume_sum("BTC_USDT", 300.0) / 5.0
+            f['btc_vol_ratio'] = btc_vol / btc_vol_base if btc_vol_base > 0 else 1.0
+        else:
+            f['btc_trend'] = 0
+            f['btc_atr_pct'] = 0.0
+            f['btc_vol_ratio'] = 1.0
+
+        # ── v3 extended features ──
+
+        # Trend features
+        ema_fast = cache.get_ema(symbol, period=9, window_sec=30.0) or 0.0
+        ema_slow = cache.get_ema(symbol, period=21, window_sec=60.0) or 0.0
+        f['ema_fast'] = ema_fast
+        f['ema_slow'] = ema_slow
+        f['ema_diff_pct'] = (ema_fast - ema_slow) / ema_slow if ema_slow > 0 else 0.0
+
+        # VWAP approximation: sum(price*vol) / sum(vol) over 5min
+        ticks_5m = cache.get_price_ticks(symbol, 300.0)
+        vol_5m = cache.get_volume_sum(symbol, 300.0)
+        if ticks_5m and vol_5m > 0:
+            approx_vwap = sum(p * 1.0 for _, p in ticks_5m) / len(ticks_5m)
+            f['price_vs_vwap'] = (price - approx_vwap) / approx_vwap if approx_vwap > 0 else 0.0
+        else:
+            f['price_vs_vwap'] = 0.0
+
+        # RSI (14-period on tick data, simplified)
+        ticks_60 = cache.get_price_ticks(symbol, 60.0)
+        if len(ticks_60) >= 15:
+            prices = [p for _, p in ticks_60]
+            changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+            gains = [c for c in changes[-14:] if c > 0]
+            losses = [-c for c in changes[-14:] if c < 0]
+            avg_gain = sum(gains) / 14.0 if gains else 0.0
+            avg_loss = sum(losses) / 14.0 if losses else 0.0001
+            rs = avg_gain / avg_loss
+            f['rsi'] = 100.0 - (100.0 / (1.0 + rs))
+        else:
+            f['rsi'] = 50.0
+
+        # MACD histogram (EMA12 - EMA26 - signal9)
+        ema12 = cache.get_ema(symbol, period=12, window_sec=60.0) or 0.0
+        ema26 = cache.get_ema(symbol, period=26, window_sec=120.0) or 0.0
+        macd_line = ema12 - ema26
+        f['macd_hist'] = macd_line / price if price > 0 else 0.0
+
+        # Bollinger Band width
+        if len(ticks_60) >= 20:
+            prices_20 = [p for _, p in ticks_60[-20:]]
+            mean_p = sum(prices_20) / len(prices_20)
+            std_p = (sum((p - mean_p) ** 2 for p in prices_20) / len(prices_20)) ** 0.5
+            f['bb_width'] = (4.0 * std_p) / mean_p if mean_p > 0 else 0.0
+        else:
+            f['bb_width'] = 0.0
+
+        # Recent range
+        f['recent_range_pct'] = snapshot.price_range_1m / 100.0
+
+        # Momentum: returns over windows
+        ticks_5s = cache.get_price_ticks(symbol, 5.0)
+        ticks_3s = cache.get_price_ticks(symbol, 3.0)
+        if len(ticks_5s) >= 2:
+            f['last_5s_return'] = (ticks_5s[-1][1] - ticks_5s[0][1]) / ticks_5s[0][1] if ticks_5s[0][1] > 0 else 0
+        else:
+            f['last_5s_return'] = 0.0
+        if len(ticks_3s) >= 2:
+            f['last_3s_return'] = (ticks_3s[-1][1] - ticks_3s[0][1]) / ticks_3s[0][1] if ticks_3s[0][1] > 0 else 0
+        else:
+            f['last_3s_return'] = 0.0
+        f['candle_body_ratio'] = features.micro_range_pct / max(snapshot.price_range_1m, 0.001)
+
+        # Volume features
+        vol_1m = snapshot.volume_1m
+        vol_5m_avg = snapshot.volume_5m_avg
+        if vol_5m_avg > 0:
+            f['volume_zscore'] = (vol_1m - vol_5m_avg) / max(vol_5m_avg, 1e-9)
+        else:
+            f['volume_zscore'] = 0.0
+        vol_30s = cache.get_volume_sum(symbol, 30.0)
+        vol_60s = cache.get_volume_sum(symbol, 60.0)
+        f['volume_trend'] = vol_30s / max(vol_60s - vol_30s, 1e-9) if vol_60s > vol_30s else 1.0
+        vol_10s = cache.get_volume_sum(symbol, 10.0)
+        vol_20s = cache.get_volume_sum(symbol, 20.0)
+        recent_rate = vol_10s / 10.0 if vol_10s > 0 else 0
+        older_rate = (vol_20s - vol_10s) / 10.0 if (vol_20s - vol_10s) > 0 else 0.001
+        f['volume_acceleration'] = recent_rate / older_rate if older_rate > 0 else 1.0
+
+        # Orderbook / microstructure
+        f['bid_ask_spread'] = snapshot.spread_pct / 100.0
+        f['bid_volume'] = snapshot.bid_volume
+        f['ask_volume'] = snapshot.ask_volume
+        total_ob = snapshot.bid_volume + snapshot.ask_volume
+        f['orderbook_imbalance'] = snapshot.bid_volume / total_ob if total_ob > 0 else 0.5
+
+        # Trade context
+        last_ts = self._last_trade_ts.get(symbol, 0.0)
+        f['time_since_last_trade'] = now - last_ts if last_ts > 0 else 999.0
+        f['trades_last_10m'] = self._state.trades_today
+
+        # Market regime classification
+        atr = f['atr_pct']
+        bb_w = f['bb_width']
+        ema_d = abs(f['ema_diff_pct'])
+        if atr > 0.015 or bb_w > 0.04:
+            regime = 2  # HIGH_VOLATILITY
+        elif atr < 0.003 and bb_w < 0.01:
+            regime = 3  # LOW_VOLATILITY
+        elif ema_d > 0.002:
+            regime = 1  # TREND
+        else:
+            regime = 0  # RANGE
+        f['market_regime'] = regime
+
+        return f
 
     def _wr_text(self) -> str:
         total = self.wins + self.losses
@@ -1459,17 +1646,34 @@ class ScalperEngine:
             if len(self._pending_orders) >= int(self.cfg.max_pending_orders):
                 continue
 
+            # ── ML pre-trade checks ──
+            adj = self.analytics.get_adjustment()
+            if adj.trading_blocked:
+                continue
+            if self.analytics.is_symbol_blocked(signal.symbol):
+                continue
+
             balance_now = self.portfolio.get_balance("USDT") if self.portfolio else self.balance_usdt
             stake_limit = float(getattr(self.cfg, "max_stake_usd", self.cfg.max_position_size_usdt))
             stake = min(stake_limit, balance_now)
             if stake <= 0:
                 continue
             max_pos = int(getattr(self.cfg, "slot_count", self.cfg.max_open_positions))
+            if adj.max_positions_override is not None:
+                max_pos = min(max_pos, adj.max_positions_override)
             avail = balance_now
 
             while self._trade_rate_window and now - self._trade_rate_window[0] > 1.0:
                 self._trade_rate_window.popleft()
             if len(self._trade_rate_window) >= int(max(float(self.cfg.max_trade_rate_per_sec), 1.0)):
+                continue
+
+            # Apply ML score adjustment to signal strength check
+            effective_strength = signal.strength * 100.0
+            score_delta = adj.min_score_delta
+            entry_quality = adj.entry_quality_score
+            effective_threshold = (self._filter.MIN_STRENGTH * 100.0) + score_delta - (entry_quality * 10.0)
+            if effective_strength < effective_threshold:
                 continue
 
             ok, reason = self._filter.should_trade(
@@ -1499,13 +1703,16 @@ class ScalperEngine:
 
             self._pending_orders.add(signal.symbol)
             self._trade_rate_window.append(now)
+            # Collect ML features and pass to execute
+            ml_features = self._collect_ml_features(signal.symbol, signal, features, snapshot)
             self._log_signal(signal, stake)
-            asyncio.create_task(self._execute_and_record(signal, stake))
+            asyncio.create_task(self._execute_and_record(signal, stake, ml_features))
 
-    async def _execute_and_record(self, signal: Signal, stake: float) -> None:
+    async def _execute_and_record(self, signal: Signal, stake: float,
+                                   ml_features: dict | None = None) -> None:
         """Execute signal, manage portfolio balance, log result."""
         # ── Analytics entry ──
-        _features_map = {
+        _features_map = ml_features or {
             "score": round(signal.strength * 100),
             "vol_ratio": signal.strength,
             "body_ratio": 0.5, "atr_pct": float(self.cfg.stop_loss_pct),
@@ -1519,6 +1726,54 @@ class ScalperEngine:
             features=_features_map,
         )
         self._trade_ids[signal.symbol] = _ml["trade_id"]
+
+        # ── ML gate: reject trade if ML disapproves (level >= 2) ──
+        if not _ml["approved"] and _ml["ml_level"] >= 2:
+            self.log(f"[{signal.symbol}] ML REJECTED (level={_ml['ml_level']}, "
+                     f"conf={_ml['confidence']:.2f})")
+            self._state.remove(signal.symbol)
+            self._pending_orders.discard(signal.symbol)
+            self._trade_ids.pop(signal.symbol, None)
+            if self.portfolio:
+                self.portfolio.release_balance("USDT", stake)
+            else:
+                self.balance_usdt += stake
+            return
+
+        # ── ML position sizing ──
+        size_mult = max(0.5, min(2.0, _ml.get("position_size_multiplier", 1.0)))
+        if size_mult != 1.0:
+            old_stake = stake
+            stake = round(stake * size_mult, 2)
+            diff = stake - old_stake
+            # Adjust reserved balance
+            if diff > 0:
+                if self.portfolio:
+                    if not self.portfolio.reserve_balance("USDT", diff):
+                        stake = old_stake  # can't increase, keep original
+                else:
+                    if self.balance_usdt >= diff:
+                        self.balance_usdt -= diff
+                    else:
+                        stake = old_stake
+            elif diff < 0:
+                if self.portfolio:
+                    self.portfolio.release_balance("USDT", abs(diff))
+                else:
+                    self.balance_usdt += abs(diff)
+            if stake != old_stake:
+                self.log(f"[{signal.symbol}] ML size adjust: ${old_stake:.2f} → ${stake:.2f} "
+                         f"(x{size_mult:.2f})")
+
+        # ── ML TP/SL adjustment ──
+        adj = self.analytics.get_adjustment()
+        if adj.tp_adjustment != 1.0 or adj.sl_adjustment != 1.0:
+            signal.tp_pct = signal.tp_pct * max(0.5, min(2.0, adj.tp_adjustment))
+            signal.sl_pct = signal.sl_pct * max(0.5, min(2.0, adj.sl_adjustment))
+            signal.tp_price = signal.entry_price * (1 + signal.direction * signal.tp_pct)
+            signal.sl_price = signal.entry_price * (1 - signal.direction * signal.sl_pct)
+            self.log(f"[{signal.symbol}] ML TP/SL adjust: TP x{adj.tp_adjustment:.2f}, "
+                     f"SL x{adj.sl_adjustment:.2f}")
 
         try:
             result = await self._executor.execute_signal(signal, stake)
@@ -1570,7 +1825,7 @@ class ScalperEngine:
         else:
             self.losses += 1
 
-        # ── Analytics exit ──
+        # ── Analytics exit (with MFE/MAE) ──
         _tid = self._trade_ids.pop(signal.symbol, None)
         if _tid:
             self.analytics.on_exit(
@@ -1578,6 +1833,8 @@ class ScalperEngine:
                 exit_reason=result.exit_reason,
                 pnl=net_pnl,
                 pnl_pct=net_pnl / stake if stake > 0 else 0,
+                mfe=getattr(result, 'mfe', 0.0),
+                mae=getattr(result, 'mae', 0.0),
             )
 
         # Log in project-standard format (make_log_callback parses "SELL" + "PnL:")
