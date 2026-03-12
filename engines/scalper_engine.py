@@ -2065,21 +2065,10 @@ class ScalperEngine:
                 print(f"[DEBUG {symbol}] SKIP: atr_too_low atr={atr_1m_pct:.5f} "
                       f"floor={float(self.cfg.atr_filter_min)*0.4:.5f}", flush=True)
             return
-        # Do not enter if ATR is so small that even a 1.3× dynamic SL would be
-        # narrower than the raw noise floor (0.20% bilateral commission).
-        _min_viable_sl = (MAKER_FEE + TAKER_FEE) * 1.0   # jedna strona round-trip
-        if atr_1m_pct * 1.3 < _min_viable_sl:
-            if _dbg_throttle:
-                self._debug_last_print[symbol] = time.time()
-                print(f"[DEBUG {symbol}] SKIP: atr_below_fee_floor atr={atr_1m_pct:.5f} "
-                      f"viable_sl={atr_1m_pct*1.3:.5f} fee_floor={_min_viable_sl:.5f}", flush=True)
-            return
         if _dbg_throttle:
             self._debug_last_print[symbol] = time.time()
             print(f"[DEBUG {symbol}] atr={atr_1m_pct:.5f} "
-                  f"filter_min={float(self.cfg.atr_filter_min):.5f} "
-                  f"viable_sl={atr_1m_pct*1.3:.5f} "
-                  f"fee_floor={_min_viable_sl:.5f}", flush=True)
+                  f"filter_min={float(self.cfg.atr_filter_min):.5f}", flush=True)
 
         signals: list[Signal] = []
         features = self._features.compute(snapshot)
