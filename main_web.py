@@ -160,12 +160,8 @@ def get_total_exposure(engines: list) -> float:
     return total
 
 def get_total_equity(engines: list) -> float:
-    if scalper_engine and hasattr(scalper_engine, 'exchange_client'):
-        try:
-            bal = scalper_engine.exchange_client.fetch_balance()
-            base = float(bal.get("USDT", {}).get("free", 0.0))
-        except Exception:
-            base = scalper_engine.balance_usdt
+    if scalper_engine:
+        base = scalper_engine.balance_usdt
     else:
         base = wallet.get_total("USDT")
     return base + get_total_exposure(engines)
@@ -733,15 +729,9 @@ async def stop_bot(bot: str, user=Depends(verify_token)):
 def get_portfolio(user=Depends(verify_token)):
     engines = [e for e in [scalper_engine, lowcap_engine, grid_bot_engine] if e]
     exposure = get_total_exposure(engines)
-    # Live mode: fetch real balance directly from Gate.io
-    available = 0.0
-    if scalper_engine and hasattr(scalper_engine, 'exchange_client'):
-        try:
-            bal = scalper_engine.exchange_client.fetch_balance()
-            available = float(bal.get("USDT", {}).get("free", 0.0))
-            scalper_engine.balance_usdt = available  # sync cached value
-        except Exception:
-            available = scalper_engine.balance_usdt  # fallback to cached
+    # Live mode: use cached balance_usdt (refreshed by _run and _process_symbol)
+    if scalper_engine:
+        available = scalper_engine.balance_usdt
     else:
         available = wallet.get_total("USDT")
     equity = available + exposure
@@ -806,10 +796,7 @@ async def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_to
             raise HTTPException(400, "stake_usd musi byc > 0")
         if req.max_slots < 1 or req.max_slots > 10:
             raise HTTPException(400, "max_slots musi byc w zakresie 1-10")
-        try:
-            _live_bal = float(scalper_engine.exchange_client.fetch_balance().get("USDT", {}).get("free", 0.0)) if scalper_engine else wallet.start_balance
-        except Exception:
-            _live_bal = scalper_engine.balance_usdt if scalper_engine else wallet.start_balance
+        _live_bal = scalper_engine.balance_usdt if scalper_engine else wallet.start_balance
         if req.stake_usd * req.max_slots > _live_bal:
             raise HTTPException(
                 400,

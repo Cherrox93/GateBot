@@ -1020,7 +1020,12 @@ class ScalperEngine:
         self._impulses: dict[str, dict] = {}
 
         # Stats (exposed for /status and main_web.py)
-        self.balance_usdt = cfg.start_balance
+        # Fetch real balance at init so dashboard shows correct value immediately
+        try:
+            _init_bal = self.exchange_client.fetch_balance()
+            self.balance_usdt = float(_init_bal.get("USDT", {}).get("free", 0.0))
+        except Exception:
+            self.balance_usdt = cfg.start_balance
         self.realized_profit = 0.0
         self.daily_realized = 0.0
         self.session_profit: float = 0.0
@@ -1562,6 +1567,9 @@ class ScalperEngine:
                 continue
 
             stake = held * current_price
+            min_stake_usdt = 1.0  # ignore dust positions below $1
+            if stake < min_stake_usdt:
+                continue
 
             # Reconstruct position with conservative SL (dynamic ATR-based)
             # We don't know original entry price — use current as approximation
