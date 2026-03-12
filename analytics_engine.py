@@ -38,7 +38,7 @@ BOT_PROFILES = {
         'atr_min':                0.003,
         'atr_max':                0.020,
         'hold_max_ok':            300,
-        'min_samples_rule':       8,
+        'min_samples_rule':       5,
         'blacklist_wr_threshold': 0.30,
         'whitelist_wr_threshold': 0.65,
         'bad_hour_wr':            0.35,
@@ -392,12 +392,24 @@ class RuleEngine:
             sym_stats[s]['total'] += 1
             sym_stats[s]['wins'] += t.get('win', 0)
 
+        # For small symbol universes (scalper: 3 symbols), hard blacklisting
+        # removes too much opportunity. Instead apply a graduated score penalty
+        # to weak symbols and a score boost to strong ones.
+        # symbol_blacklist stays empty — blocking is handled via min_score_delta.
         for sym, ss in sym_stats.items():
             if ss['total'] >= max(min_s, 8):
                 wr = ss['wins'] / ss['total']
                 if wr < p['blacklist_wr_threshold']:
-                    adj.symbol_blacklist.append(sym)
+                    # Weak symbol: raise entry bar by adding to global score delta.
+                    # This makes the signal filter stricter without hard-blocking.
+                    penalty = int((p['blacklist_wr_threshold'] - wr) * 100)
+                    penalty = min(penalty, 20)  # cap at 20 points
+                    adj.min_score_delta += penalty
                 elif wr > p['whitelist_wr_threshold']:
+                    # Strong symbol: lower entry bar slightly as a bonus.
+                    boost = int((wr - p['whitelist_wr_threshold']) * 50)
+                    boost = min(boost, 8)  # cap boost at 8 points
+                    adj.min_score_delta -= boost
                     adj.symbol_whitelist.append(sym)
 
         # ── 4. BTC kontekst ──
@@ -495,9 +507,9 @@ class MLPipeline:
         self._use_raw = False
 
     def get_level(self, trade_count: int) -> int:
-        if trade_count >= 1000: return 4
-        if trade_count >= 500:  return 3
-        if trade_count >= 200:  return 2
+        if trade_count >= 500:  return 4
+        if trade_count >= 200:  return 3
+        if trade_count >= 20:   return 2
         return 1
 
     def train(self, trades: list, level: int):
@@ -513,7 +525,10 @@ class MLPipeline:
             X = np.array([[float(t.get(c) or 0) for c in FEATURE_COLS] for t in trades])
             y = np.array([int(t.get('win', 0)) for t in trades])
 
-            if len(X) < 50 or y.sum() < 10 or (1 - y).sum() < 10:
+            # Low sample guard: LR at level 2 needs at least 20 samples
+            # with at least 5 wins and 5 losses to produce meaningful signal.
+            # Model will be weak but directionally useful from trade 20+.
+            if len(X) < 20 or y.sum() < 5 or (1 - y).sum() < 5:
                 return
 
             with self._lock:
@@ -874,8 +889,8 @@ class AnalyticsEngine:
             ex_stats[er]['pnl'] += (t.get('pnl') or 0)
 
         ml_level = self.ml_pipeline.get_level(count)
-        next_at = {1: 200, 2: 500, 3: 1000, 4: None}.get(ml_level)
-        base_at = {1: 0, 2: 200, 3: 500, 4: 1000}.get(ml_level, 0)
+        next_at = {1: 20, 2: 200, 3: 500, 4: None}.get(ml_level)
+        base_at = {1: 0, 2: 20, 3: 200, 4: 500}.get(ml_level, 0)
         progress = min(100, int((count - base_at) / (next_at - base_at) * 100)) if next_at else 100
 
         adj = self._adjustment
@@ -891,8 +906,10 @@ class AnalyticsEngine:
             'feature_importance': self.ml_pipeline.get_feature_importance(),
             'ml_level': ml_level,
             'ml_level_name': {
-                1: 'Rule Engine', 2: 'Logistic Regression',
-                3: 'Random Forest', 4: 'Meta Model (LightGBM)',
+                1: 'Rule Engine',
+                2: 'Logistic Regression (early)',
+                3: 'Random Forest',
+                4: 'Meta Model (LightGBM)',
             }.get(ml_level, 'Rule Engine'),
             'ml_auc': round(self.ml_pipeline.last_auc, 3),
             'ml_samples': self.ml_pipeline.n_samples_trained,
@@ -964,7 +981,7 @@ class AnalyticsEngine:
             'hour_wr': {}, 'symbol_wr': [], 'worst_symbols': [], 'exit_stats': {},
             'feature_importance': {}, 'ml_level': 1,
             'ml_level_name': 'Rule Engine', 'ml_auc': 0, 'ml_samples': 0,
-            'next_level_at': 200, 'ml_progress': 0,
+            'next_level_at': 20, 'ml_progress': 0,
             'active_adjustments': {
                 'score_delta': 0, 'vol_delta': 0, 'blacklist': [],
                 'whitelist': [], 'blocked': False, 'block_reason': '', 'confidence': 0,

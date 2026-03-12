@@ -24,11 +24,10 @@ import websockets
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-from config import ScalperConfig, EXCHANGE, TRADING_MODE
+from config import ScalperConfig
 from market_data import MarketData
-from vault import TELEGRAM_SCALPER
+from vault import TELEGRAM_SCALPER, GATEIO_LIVE
 from analytics_engine import get_analytics
-from paper_execution import PaperExecution
 
 
 # ============================================================
@@ -138,6 +137,9 @@ class OpenPosition:
     entry_order_id: str
     tp_order_id: Optional[str]
     strategy: str
+    sl_pct: float = 0.0
+    entry_fee_cost: float = 0.0
+    entry_fee_currency: str = "USDT"
 
 
 @dataclass
@@ -550,11 +552,13 @@ class ExecutionEngine:
         maker_wait_ms: int = SOR_MAKER_WAIT_MS,
         aggressive_wait_ms: int = SOR_AGGR_WAIT_MS,
         position_callback=None,
+        cache: Optional[MarketDataCache] = None,
     ) -> None:
         self.exchange = exchange
         self.maker_wait_ms = maker_wait_ms
         self.aggressive_wait_ms = aggressive_wait_ms
         self.position_callback = position_callback
+        self._cache = cache
 
     @staticmethod
     def _ccxt(symbol: str) -> str:
@@ -602,13 +606,26 @@ class ExecutionEngine:
         except Exception:
             pass
 
-    async def _market_sell(self, pos: OpenPosition, ccxt_sym: str) -> float:
+    async def _market_sell(self, pos: OpenPosition, ccxt_sym: str) -> dict:
         side = "sell" if pos.direction == 1 else "buy"
         try:
             o = await self._call(self.exchange.create_order, ccxt_sym, "market", side, pos.qty)
-            return float(o.get("average") or o.get("price") or pos.entry_price)
+            # Fetch the completed order for real fill data
+            order_id = o.get("id")
+            if order_id:
+                await asyncio.sleep(0.5)  # brief wait for exchange to settle
+                o = await self._call(self.exchange.fetch_order, order_id, ccxt_sym) or o
+            return {
+                "price": float(o.get("average") or o.get("price") or pos.entry_price),
+                "fee_cost": float((o.get("fee") or {}).get("cost") or 0.0),
+                "fee_currency": (o.get("fee") or {}).get("currency") or "USDT",
+            }
         except Exception:
-            return pos.entry_price
+            return {
+                "price": pos.entry_price,
+                "fee_cost": 0.0,
+                "fee_currency": "USDT",
+            }
 
     async def _last_price(self, ccxt_sym: str, fallback: float) -> float:
         try:
@@ -626,10 +643,13 @@ class ExecutionEngine:
         except Exception:
             return fallback, fallback
 
-    async def _taker_order(self, ccxt_sym: str, side: str, qty: float) -> Optional[float]:
+    async def _taker_order(self, ccxt_sym: str, side: str, qty: float) -> Optional[dict]:
         try:
             o = await self._call(self.exchange.create_order, ccxt_sym, "market", side, qty)
-            return float(o.get("average") or o.get("price") or 0.0) or None
+            price = float(o.get("average") or o.get("price") or 0.0)
+            if not price:
+                return None
+            return o
         except Exception:
             return None
 
@@ -688,27 +708,69 @@ class ExecutionEngine:
                         await self._cancel_if_open(ccxt_sym, order_id)
 
         # 3) Market fallback
+        _taker_raw: Optional[dict] = None
         if filled_price is None:
-            taker_fill = await self._taker_order(ccxt_sym, side, qty)
-            if taker_fill is None:
+            _taker_raw = await self._taker_order(ccxt_sym, side, qty)
+            if _taker_raw is None:
                 return self._missed(signal, stake, "sor_no_fill")
-            filled_price = taker_fill
-            order_id = "market_fallback"
+            filled_price = float(_taker_raw.get("average") or _taker_raw.get("price"))
+            order_id = _taker_raw.get("id") or "market_fallback"
+
+        # Fetch verified entry fill from exchange
+        try:
+            if order_id and order_id != "market_fallback":
+                entry_order_data = await self._call(
+                    self.exchange.fetch_order, order_id, ccxt_sym
+                )
+            elif _taker_raw:
+                entry_order_data = _taker_raw
+            else:
+                entry_order_data = {}
+            real_entry_price = float(
+                entry_order_data.get("average")
+                or entry_order_data.get("price")
+                or filled_price
+            )
+            real_entry_qty = float(
+                entry_order_data.get("filled") or qty
+            )
+            real_entry_fee_cost = float(
+                (entry_order_data.get("fee") or {}).get("cost") or 0.0
+            )
+            real_entry_fee_currency = (
+                (entry_order_data.get("fee") or {}).get("currency") or "USDT"
+            )
+        except Exception:
+            real_entry_price = filled_price
+            real_entry_qty = qty
+            real_entry_fee_cost = 0.0
+            real_entry_fee_currency = "USDT"
+
+        # Dynamic SL: at least 1.3× the 1-minute ATR, floored at STOP_LOSS_PCT
+        cache_ref = self._cache
+        _atr = cache_ref.get_atr_1m_pct(signal.symbol) if cache_ref else 0.0
+        _dynamic_sl = max(_atr * 1.3, STOP_LOSS_PCT)
+        _dynamic_sl = min(_dynamic_sl, STOP_LOSS_PCT * 4.0)   # cap at 4× to avoid runaway SL
 
         # TP/SL prices — exact user settings, no fee adjustment
         # Fees are only accounted for in PnL display/logging, not in trigger prices
         pos = OpenPosition(
             symbol=signal.symbol, direction=signal.direction,
-            entry_price=filled_price,
-            tp_price=filled_price * (1 + signal.direction * TARGET_PROFIT_PCT),
-            sl_price=filled_price * (1 - signal.direction * STOP_LOSS_PCT),
-            qty=qty, stake=stake,
+            entry_price=real_entry_price,
+            tp_price=real_entry_price * (1 + signal.direction * TARGET_PROFIT_PCT),
+            sl_price=real_entry_price * (1 - signal.direction * _dynamic_sl),
+            qty=real_entry_qty, stake=stake,
             entry_time=time.time(), entry_order_id=order_id,
             tp_order_id=None, strategy=signal.strategy,
+            sl_pct=_dynamic_sl,
+            entry_fee_cost=real_entry_fee_cost,
+            entry_fee_currency=real_entry_fee_currency,
         )
         print(
-            f"[{signal.symbol}] OPEN entry={filled_price:.6f}"
-            f" TP={TARGET_PROFIT_PCT:.4f} SL={STOP_LOSS_PCT:.4f}"
+            f"[{signal.symbol}] OPEN entry={real_entry_price:.6f}"
+            f" qty={real_entry_qty:.6f} fee={real_entry_fee_cost:.6f}{real_entry_fee_currency}"
+            f" ATR={_atr:.5f} dynamic_SL={_dynamic_sl:.5f}"
+            f" TP={TARGET_PROFIT_PCT:.5f}"
             f" tp_price={pos.tp_price:.6f} sl_price={pos.sl_price:.6f}",
             flush=True,
         )
@@ -720,6 +782,8 @@ class ExecutionEngine:
     async def _monitor(self, pos: OpenPosition, ccxt_sym: str, fill_latency_sec: float) -> TradeResult:
         exit_reason = "SL"
         exit_price = pos.entry_price
+        exit_fee_cost = 0.0
+        exit_fee_currency = "USDT"
         peak_net_pnl = 0.0
         _last_pos_broadcast = 0.0
         # MFE/MAE tracking (gross pnl extremes)
@@ -729,8 +793,6 @@ class ExecutionEngine:
         runner_active: bool = False
         runner_sl: float = 0.0
         runner_peak: float = 0.0
-        # Fee estimate for net_pnl calc (entry maker + exit taker)
-        TOTAL_FEE = MAKER_FEE + TAKER_FEE
 
         while True:
             # a) sleep
@@ -751,6 +813,8 @@ class ExecutionEngine:
                     tp = await self._call(self.exchange.fetch_order, pos.tp_order_id, ccxt_sym)
                     if tp["status"] in ("closed", "filled"):
                         exit_price = float(tp.get("average") or tp.get("price") or pos.tp_price)
+                        exit_fee_cost = float((tp.get("fee") or {}).get("cost") or 0.0)
+                        exit_fee_currency = (tp.get("fee") or {}).get("currency") or "USDT"
                         exit_reason = "TP_MAKER"
                         break
                 except Exception:
@@ -758,7 +822,9 @@ class ExecutionEngine:
 
             # e) calc gross_pnl and net_pnl
             gross_pnl = (current / pos.entry_price - 1.0) * pos.direction
-            net_pnl = gross_pnl - TOTAL_FEE
+            # net_pnl here is an estimate for trigger logic only
+            # actual fee is recorded at exit from exchange data
+            net_pnl = gross_pnl - (MAKER_FEE + TAKER_FEE)
 
             # Track MFE/MAE (gross)
             if gross_pnl > _max_favorable:
@@ -774,13 +840,16 @@ class ExecutionEngine:
                 if current <= effective_sl:
                     if pos.tp_order_id:
                         await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                    exit_price = await self._market_sell(pos, ccxt_sym)
+                    _exit_order = await self._market_sell(pos, ccxt_sym)
+                    exit_price = _exit_order["price"]
+                    exit_fee_cost = _exit_order["fee_cost"]
+                    exit_fee_currency = _exit_order["fee_currency"]
                     exit_reason = "RUNNER"
                     break
                 continue  # runner active — skip other checks
 
             # g) RUNNER activation — gross profit minus fees covers target
-            if gross_pnl - TOTAL_FEE >= TARGET_PROFIT_PCT:
+            if gross_pnl - (MAKER_FEE + TAKER_FEE) >= TARGET_PROFIT_PCT:
                 runner_active = True
                 runner_sl = pos.tp_price
                 runner_peak = current
@@ -797,20 +866,27 @@ class ExecutionEngine:
                 if peak_net_pnl - net_pnl >= TRAILING_STOP_PCT:
                     if pos.tp_order_id:
                         await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                    exit_price = await self._market_sell(pos, ccxt_sym)
+                    _exit_order = await self._market_sell(pos, ccxt_sym)
+                    exit_price = _exit_order["price"]
+                    exit_fee_cost = _exit_order["fee_cost"]
+                    exit_fee_currency = _exit_order["fee_currency"]
                     exit_reason = "TRAIL"
                     break
 
-            # i) SL check — uses gross (no fee in trigger)
-            if gross_pnl <= -STOP_LOSS_PCT:
+            # i) SL check — uses gross (no fee in trigger), dynamic per-position
+            if gross_pnl <= -pos.sl_pct:
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                exit_price = await self._market_sell(pos, ccxt_sym)
+                _exit_order = await self._market_sell(pos, ccxt_sym)
+                exit_price = _exit_order["price"]
+                exit_fee_cost = _exit_order["fee_cost"]
+                exit_fee_currency = _exit_order["fee_currency"]
                 exit_reason = "SL"
                 break
 
 
         return self._build_result(pos, exit_price, exit_reason, fill_latency_sec,
+                                  exit_fee_cost=exit_fee_cost, exit_fee_currency=exit_fee_currency,
                                   mfe=_max_favorable, mae=_max_adverse)
 
     def _build_result(
@@ -819,17 +895,21 @@ class ExecutionEngine:
         exit_price: float,
         exit_reason: str,
         fill_latency_sec: float,
+        exit_fee_cost: float = 0.0,
+        exit_fee_currency: str = "USDT",
         mfe: float = 0.0,
         mae: float = 0.0,
     ) -> TradeResult:
-        raw_pnl = (exit_price / pos.entry_price - 1) * pos.direction * pos.stake
-        entry_fee = pos.stake * MAKER_FEE
-        exit_fee = pos.stake * (MAKER_FEE if exit_reason == "TP_MAKER" else TAKER_FEE)
+        # All prices and fees are real exchange data — no local estimation
+        real_qty = pos.qty
+        raw_pnl = (exit_price - pos.entry_price) * real_qty * pos.direction
+        total_fee = pos.entry_fee_cost + exit_fee_cost
+
         return TradeResult(
             symbol=pos.symbol, direction=pos.direction, strategy=pos.strategy,
             entry_price=pos.entry_price, exit_price=exit_price,
             stake=pos.stake, pnl_usd=raw_pnl,
-            fee_paid=entry_fee + exit_fee, exit_reason=exit_reason, fill_latency_sec=fill_latency_sec,
+            fee_paid=total_fee, exit_reason=exit_reason, fill_latency_sec=fill_latency_sec,
             duration=time.time() - pos.entry_time, timestamp=time.time(),
             mfe=mfe, mae=mae,
         )
@@ -886,32 +966,34 @@ class ScalperEngine:
         self.log_callback = log_callback
         self.market_data = market_data      # kept for compatibility; engine uses own WS
         self.tg = tg
+        # portfolio parameter kept for interface compatibility — not used in live mode
         self.portfolio = portfolio
 
         # Analytics
         self.analytics = get_analytics('scalper')
         self._trade_ids: dict = {}
 
-        # ccxt (public market data only)
+        # ccxt — real Gate.io credentials for live spot trading
         self.exchange_client = ccxt.gateio({
-            "apiKey": EXCHANGE.api_key,
-            "secret": EXCHANGE.secret_key,
+            "apiKey": GATEIO_LIVE.api_key,
+            "secret": GATEIO_LIVE.secret_key,
             "enableRateLimit": True,
+            "options": {
+                "defaultType": "spot",
+            },
         })
-        self.paper_execution = PaperExecution(self.portfolio, self.market_data) if self.portfolio else None
 
         # Components
         self._cache    = MarketDataCache()
         self._features = FeatureEngine(self._cache)
         self._filter   = TradeFilter()
         self._filter.MIN_STRENGTH = float(self.cfg.min_signal_strength)
-        if TRADING_MODE != "paper":
-            raise RuntimeError("ScalperEngine blocks real trading. Set TRADING_MODE='paper'.")
         self._executor = ExecutionEngine(
-            self.paper_execution,
+            self.exchange_client,
             maker_wait_ms=int(self.cfg.sor_maker_wait_ms),
             aggressive_wait_ms=int(self.cfg.sor_aggressive_wait_ms),
             position_callback=self._broadcast_position,
+            cache=self._cache,
         )
         self._state    = _BotState()
         self._positions_lock = threading.Lock()
@@ -1066,7 +1148,7 @@ class ScalperEngine:
         return ""
 
     def _get_status_text(self) -> str:
-        bal = self.portfolio.get_balance("USDT") if self.portfolio else self.balance_usdt
+        bal = self.balance_usdt
         total = self.wins + self.losses
         wr = f"{self.wins / total * 100:.0f}" if total > 0 else "0"
         lines = [
@@ -1433,11 +1515,129 @@ class ScalperEngine:
                 self.tg.start_polling_async(self._handle_command)
             )
 
+    async def _recover_open_positions(self) -> None:
+        """
+        On startup, query Gate.io for any open orders and open balances
+        that match our trading symbols. Reconstruct OpenPosition objects
+        and resume SL monitoring for each recovered position.
+        Called once from _run() before WebSocket and symbol tasks start.
+        """
+        loop = asyncio.get_running_loop()
+        recovered = 0
+
+        try:
+            # Fetch all open orders on spot
+            open_orders = await loop.run_in_executor(
+                None, lambda: self.exchange_client.fetch_open_orders()
+            )
+            # Fetch current balances to detect held assets
+            balances = await loop.run_in_executor(
+                None, lambda: self.exchange_client.fetch_balance()
+            )
+        except Exception as e:
+            self.log(f"[RECOVERY] Błąd pobierania danych z giełdy: {e}")
+            return
+
+        for symbol in self._symbols:
+            base_currency = symbol.split("_")[0]   # e.g. BTC from BTC_USDT
+            held = float(balances.get(base_currency, {}).get("total", 0.0))
+            if held <= 0:
+                continue
+
+            # Find matching open TP order for this symbol
+            ccxt_sym = symbol.replace("_", "/")
+            sym_orders = [o for o in open_orders if o.get("symbol") == ccxt_sym]
+            tp_order_id = sym_orders[0]["id"] if sym_orders else None
+
+            # Estimate entry price from current ticker (best we can do without DB)
+            try:
+                ticker = await loop.run_in_executor(
+                    None, lambda: self.exchange_client.fetch_ticker(ccxt_sym)
+                )
+                current_price = float(ticker.get("last") or ticker.get("bid") or 0.0)
+            except Exception:
+                current_price = 0.0
+
+            if current_price <= 0:
+                continue
+
+            stake = held * current_price
+
+            # Reconstruct position with conservative SL (dynamic ATR-based)
+            # We don't know original entry price — use current as approximation
+            atr = self._cache.get_atr_1m_pct(symbol)
+            recovery_sl_pct = max(atr * 1.3, float(self.cfg.stop_loss_pct))
+
+            pos = OpenPosition(
+                symbol=symbol,
+                direction=1,  # spot — always long
+                entry_price=current_price,
+                tp_price=current_price * (1 + TARGET_PROFIT_PCT),
+                sl_price=current_price * (1 - recovery_sl_pct),
+                sl_pct=recovery_sl_pct,
+                qty=held,
+                stake=stake,
+                entry_time=time.time(),
+                entry_order_id="recovered",
+                tp_order_id=tp_order_id,
+                strategy="recovered",
+            )
+
+            self._state.add(pos)
+            recovered += 1
+
+            msg = (
+                f"♻️ RECOVERY: {symbol} | held={held:.6f} {base_currency}"
+                f" | ~price={current_price:.4f} | SL={pos.sl_price:.4f}"
+                f" | TP_order={'yes' if tp_order_id else 'none'}"
+            )
+            self.log(msg)
+            await self._tg(msg)
+
+            # Resume monitoring in background task
+            ccxt_sym_monitor = symbol.replace("_", "/")
+            asyncio.create_task(
+                self._executor._monitor(pos, ccxt_sym_monitor, fill_latency_sec=0.0)
+            )
+
+        if recovered == 0:
+            self.log("[RECOVERY] Brak otwartych pozycji — czyste uruchomienie")
+        else:
+            self.log(f"[RECOVERY] Przywrócono {recovered} pozycji — monitoring aktywny")
+
     async def _run(self) -> None:
         start_msg = "🏁 SCALPER START"
         self.log(start_msg)
         self.gui_log(start_msg)
         await self._tg(start_msg)
+
+        # Verify API connectivity and fetch real balance before starting
+        try:
+            loop = asyncio.get_running_loop()
+            balance_raw = await loop.run_in_executor(
+                None, lambda: self.exchange_client.fetch_balance()
+            )
+            usdt_free = float(balance_raw.get("USDT", {}).get("free", 0.0))
+            if usdt_free <= 0:
+                msg = "⛔ SCALPER: Brak środków USDT na koncie Gate.io — bot zatrzymany"
+                self.log(msg)
+                await self._tg(msg)
+                self.running = False
+                return
+            self.balance_usdt = usdt_free
+            msg = f"✅ SCALPER LIVE: Połączono z Gate.io | USDT free: {usdt_free:.2f}$"
+            self.log(msg)
+            self.gui_log(msg)
+            await self._tg(msg)
+        except Exception as e:
+            msg = f"⛔ SCALPER: Błąd połączenia z Gate.io: {e}"
+            self.log(msg)
+            await self._tg(msg)
+            self.running = False
+            return
+
+        await self._recover_open_positions()
+
         if self._warmup_ready():
             self._refresh_scalper_pairs()
 
@@ -1593,6 +1793,11 @@ class ScalperEngine:
         atr_1m_pct = self._cache.get_atr_1m_pct(symbol)
         if atr_1m_pct <= float(self.cfg.atr_filter_min) * 0.4:
             return
+        # Do not enter if ATR is so small that even a 1.3× dynamic SL would be
+        # narrower than the raw noise floor (0.20% bilateral commission).
+        _min_viable_sl = (MAKER_FEE + TAKER_FEE) * 2.0   # 2× round-trip fee
+        if atr_1m_pct * 1.3 < _min_viable_sl:
+            return
 
         signals: list[Signal] = []
         features = self._features.compute(snapshot)
@@ -1693,6 +1898,17 @@ class ScalperEngine:
                 )
             )
 
+        # Fetch balance once before processing signals (avoid rate limit)
+        if signals:
+            try:
+                loop = asyncio.get_running_loop()
+                _bal = await loop.run_in_executor(
+                    None, lambda: self.exchange_client.fetch_balance()
+                )
+                self.balance_usdt = float(_bal.get("USDT", {}).get("free", 0.0))
+            except Exception:
+                pass  # keep last known balance_usdt
+
         for signal in signals:
             now = time.time()
             retry_ts = self._retry_after.get(signal.symbol, 0.0)
@@ -1713,7 +1929,7 @@ class ScalperEngine:
             if self.analytics.is_symbol_blocked(signal.symbol):
                 continue
 
-            balance_now = self.portfolio.get_balance("USDT") if self.portfolio else self.balance_usdt
+            balance_now = self.balance_usdt
             stake = self._calc_effective_stake()
             if balance_now < stake:
                 stake = balance_now
@@ -1744,6 +1960,18 @@ class ScalperEngine:
             if not ok:
                 continue
 
+            # Net R:R guard: reject signal if expected net reward < 1.0× expected net risk.
+            _atr_now = self._cache.get_atr_1m_pct(signal.symbol)
+            _eff_sl = max(_atr_now * 1.3, STOP_LOSS_PCT)
+            _net_reward = signal.tp_pct - (MAKER_FEE + TAKER_FEE)
+            _net_risk   = _eff_sl      + (MAKER_FEE + TAKER_FEE)
+            if _net_risk <= 0 or (_net_reward / _net_risk) < 1.0:
+                self.log(
+                    f"[{signal.symbol}] RR_SKIP net_reward={_net_reward:.5f}"
+                    f" net_risk={_net_risk:.5f} ratio={_net_reward/_net_risk if _net_risk>0 else 0:.2f}"
+                )
+                continue
+
             placeholder = OpenPosition(
                 symbol=signal.symbol, direction=signal.direction,
                 entry_price=signal.entry_price, tp_price=signal.tp_price,
@@ -1755,12 +1983,7 @@ class ScalperEngine:
             if not reserved:
                 continue
 
-            if self.portfolio:
-                if not self.portfolio.reserve_balance("USDT", stake):
-                    self._state.remove(signal.symbol)
-                    continue
-            else:
-                self.balance_usdt -= stake
+            self.balance_usdt -= stake  # optimistic local tracking
 
             self._pending_orders.add(signal.symbol)
             self._trade_rate_window.append(now)
@@ -1795,10 +2018,7 @@ class ScalperEngine:
             self._state.remove(signal.symbol)
             self._pending_orders.discard(signal.symbol)
             self._trade_ids.pop(signal.symbol, None)
-            if self.portfolio:
-                self.portfolio.release_balance("USDT", stake)
-            else:
-                self.balance_usdt += stake
+            self.balance_usdt += stake  # refund local tracking
             return
 
         # ── ML position sizing ──
@@ -1807,21 +2027,14 @@ class ScalperEngine:
             old_stake = stake
             stake = round(stake * size_mult, 2)
             diff = stake - old_stake
-            # Adjust reserved balance
+            # Adjust local balance tracking
             if diff > 0:
-                if self.portfolio:
-                    if not self.portfolio.reserve_balance("USDT", diff):
-                        stake = old_stake  # can't increase, keep original
+                if self.balance_usdt >= diff:
+                    self.balance_usdt -= diff
                 else:
-                    if self.balance_usdt >= diff:
-                        self.balance_usdt -= diff
-                    else:
-                        stake = old_stake
+                    stake = old_stake
             elif diff < 0:
-                if self.portfolio:
-                    self.portfolio.release_balance("USDT", abs(diff))
-                else:
-                    self.balance_usdt += abs(diff)
+                self.balance_usdt += abs(diff)
             if stake != old_stake:
                 self.log(f"[{signal.symbol}] ML size adjust: ${old_stake:.2f} → ${stake:.2f} "
                          f"(x{size_mult:.2f})")
@@ -1843,11 +2056,8 @@ class ScalperEngine:
             self._state.remove(signal.symbol)
             self._trade_ids.pop(signal.symbol, None)
             self._retry_after[signal.symbol] = time.time() + MISSED_RETRY_COOLDOWN_SEC
-            # refund
-            if self.portfolio:
-                self.portfolio.release_balance("USDT", stake)
-            else:
-                self.balance_usdt += stake
+            # refund local tracking
+            self.balance_usdt += stake
             self._pending_orders.discard(signal.symbol)
             self._last_trade_ts[signal.symbol] = time.time()
             return
@@ -1857,11 +2067,8 @@ class ScalperEngine:
 
         if result.exit_reason == "MISSED":
             self._retry_after[signal.symbol] = time.time() + MISSED_RETRY_COOLDOWN_SEC
-            # refund
-            if self.portfolio:
-                self.portfolio.release_balance("USDT", stake)
-            else:
-                self.balance_usdt += stake
+            # refund local tracking
+            self.balance_usdt += stake
             self._trade_ids.pop(signal.symbol, None)
             self.log(f"[{signal.symbol}] [{signal.strategy}] MISSED")
             self._record_execution_metrics(result)
@@ -1871,13 +2078,10 @@ class ScalperEngine:
 
         self._state.trades_today += 1
 
-        # Return stake + net P&L
+        # Return stake + net P&L — local tracking, real balance refreshed at next cycle
         net_pnl = result.pnl_usd - result.fee_paid
         sell_value = stake + net_pnl
-        if self.portfolio:
-            self.portfolio.release_balance("USDT", stake)
-        else:
-            self.balance_usdt += sell_value
+        self.balance_usdt += sell_value
 
         self.realized_profit += net_pnl
         self.daily_realized  += net_pnl
