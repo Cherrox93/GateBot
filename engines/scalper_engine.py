@@ -1032,6 +1032,7 @@ class ScalperEngine:
         self._day_start = datetime.now().date()
         self.wins = 0
         self.losses = 0
+        self._debug_last_print: dict[str, float] = {}
         self._exec_attempts = 0
         self._exec_fills = 0
         self._exec_missed = 0
@@ -1799,13 +1800,28 @@ class ScalperEngine:
             return
         # Relaxed ATR filter: allow moderate volatility regimes.
         atr_1m_pct = self._cache.get_atr_1m_pct(symbol)
+        _dbg_throttle = time.time() - self._debug_last_print.get(symbol, 0) > 10.0
         if atr_1m_pct <= float(self.cfg.atr_filter_min) * 0.4:
+            if _dbg_throttle:
+                self._debug_last_print[symbol] = time.time()
+                print(f"[DEBUG {symbol}] SKIP: atr_too_low atr={atr_1m_pct:.5f} "
+                      f"floor={float(self.cfg.atr_filter_min)*0.4:.5f}", flush=True)
             return
         # Do not enter if ATR is so small that even a 1.3× dynamic SL would be
         # narrower than the raw noise floor (0.20% bilateral commission).
         _min_viable_sl = (MAKER_FEE + TAKER_FEE) * 2.0   # 2× round-trip fee
         if atr_1m_pct * 1.3 < _min_viable_sl:
+            if _dbg_throttle:
+                self._debug_last_print[symbol] = time.time()
+                print(f"[DEBUG {symbol}] SKIP: atr_below_fee_floor atr={atr_1m_pct:.5f} "
+                      f"viable_sl={atr_1m_pct*1.3:.5f} fee_floor={_min_viable_sl:.5f}", flush=True)
             return
+        if _dbg_throttle:
+            self._debug_last_print[symbol] = time.time()
+            print(f"[DEBUG {symbol}] atr={atr_1m_pct:.5f} "
+                  f"filter_min={float(self.cfg.atr_filter_min):.5f} "
+                  f"viable_sl={atr_1m_pct*1.3:.5f} "
+                  f"fee_floor={_min_viable_sl:.5f}", flush=True)
 
         signals: list[Signal] = []
         features = self._features.compute(snapshot)
@@ -1906,6 +1922,14 @@ class ScalperEngine:
                 )
             )
 
+        if _dbg_throttle:
+            print(f"[DEBUG {symbol}] signals_generated={len(signals)} "
+                  f"price_change_5s={price_change_5s:.5f} "
+                  f"baseline_vol={baseline_volume:.2f} "
+                  f"vol_last_5s={vol_last_5s:.2f} "
+                  f"trend_dir={trend_dir} "
+                  f"trend_required={trend_required}", flush=True)
+
         # Fetch balance once before processing signals (avoid rate limit)
         if signals:
             try:
@@ -1921,20 +1945,26 @@ class ScalperEngine:
             now = time.time()
             retry_ts = self._retry_after.get(signal.symbol, 0.0)
             if now < retry_ts:
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: retry_cooldown", flush=True)
                 continue
             last_trade = self._last_trade_ts.get(signal.symbol, 0.0)
             if now - last_trade < self.symbol_cooldown_sec:
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: symbol_cooldown", flush=True)
                 continue
             if signal.symbol in self._pending_orders:
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: pending_order", flush=True)
                 continue
             if len(self._pending_orders) >= int(self.cfg.max_pending_orders):
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: max_pending_orders", flush=True)
                 continue
 
             # ── ML pre-trade checks ──
             adj = self.analytics.get_adjustment()
             if adj.trading_blocked:
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: ml_blocked reason={adj.block_reason}", flush=True)
                 continue
             if self.analytics.is_symbol_blocked(signal.symbol):
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: symbol_blocked", flush=True)
                 continue
 
             balance_now = self.balance_usdt
@@ -1942,6 +1972,7 @@ class ScalperEngine:
             if balance_now < stake:
                 stake = balance_now
             if stake <= 0:
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: no_balance bal={balance_now:.2f}", flush=True)
                 continue
             max_pos = int(getattr(self.cfg, "slot_count", self.cfg.max_open_positions))
             if adj.max_positions_override is not None:
@@ -1966,6 +1997,7 @@ class ScalperEngine:
                 self._state.trades_today, self._daily_limit_hit(), stake,
             )
             if not ok:
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: filter {reason}", flush=True)
                 continue
 
             # Net R:R guard: reject signal if expected net reward < 1.0× expected net risk.
