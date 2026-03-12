@@ -631,6 +631,20 @@ class ExecutionEngine:
                 "fee_currency": "USDT",
             }
 
+    def _get_cached_price(self, symbol: str, fallback: float) -> float:
+        """Get latest price from WebSocket cache — zero latency vs REST."""
+        if self._cache is None:
+            return fallback
+        try:
+            top = self._cache.get_top_of_book(symbol)
+            if top:
+                bid_p, ask_p, _, _ = top
+                if bid_p > 0 and ask_p > 0:
+                    return (bid_p + ask_p) / 2.0
+        except Exception:
+            pass
+        return fallback
+
     async def _last_price(self, ccxt_sym: str, fallback: float) -> float:
         try:
             t = await self._call(self.exchange.fetch_ticker, ccxt_sym)
@@ -821,8 +835,10 @@ class ExecutionEngine:
             await asyncio.sleep(MONITOR_POLL_SEC)
             now = time.time()
 
-            # b) current price
-            current = await self._last_price(ccxt_sym, pos.entry_price)
+            # b) current price — WebSocket cache first, REST fallback
+            current = self._get_cached_price(pos.symbol, 0.0)
+            if current <= 0:
+                current = await self._last_price(ccxt_sym, pos.entry_price)
 
             # c) broadcast position update every ~1s
             if self.position_callback and now - _last_pos_broadcast >= 1.0:
@@ -870,8 +886,17 @@ class ExecutionEngine:
                     break
                 continue  # runner active — skip other checks
 
-            # g) RUNNER activation — gross profit minus fees covers target
-            if gross_pnl - (MAKER_FEE + TAKER_FEE) >= TARGET_PROFIT_PCT:
+            # g) NEAR TP logging
+            if gross_pnl >= TARGET_PROFIT_PCT * 0.9:
+                print(
+                    f"[{pos.symbol}] NEAR_TP gross={gross_pnl:.5f} "
+                    f"target={TARGET_PROFIT_PCT:.5f} "
+                    f"current={current:.6f} tp={pos.tp_price:.6f}",
+                    flush=True,
+                )
+
+            # h) RUNNER activation — gross profit reached target
+            if gross_pnl >= TARGET_PROFIT_PCT:
                 runner_active = True
                 runner_sl = pos.tp_price
                 runner_peak = current
@@ -882,7 +907,7 @@ class ExecutionEngine:
                 )
                 continue  # don't sell, go to next iteration
 
-            # h) Trailing stop — only when net_pnl > 0 and TRAILING enabled
+            # i) Trailing stop — only when net_pnl > 0 and TRAILING enabled
             if TRAILING_STOP_PCT > 0 and net_pnl > 0:
                 peak_net_pnl = max(peak_net_pnl, net_pnl)
                 if peak_net_pnl - net_pnl >= TRAILING_STOP_PCT:
@@ -895,7 +920,7 @@ class ExecutionEngine:
                     exit_reason = "TRAIL"
                     break
 
-            # i) SL check — uses gross (no fee in trigger), dynamic per-position
+            # j) SL check — uses gross (no fee in trigger), dynamic per-position
             if gross_pnl <= -pos.sl_pct:
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
