@@ -647,16 +647,30 @@ class ExecutionEngine:
         except Exception:
             return fallback, fallback
 
-    async def _taker_order(self, ccxt_sym: str, side: str, qty: float) -> Optional[dict]:
+    async def _taker_order(self, ccxt_sym: str, side: str, qty: float,
+                           price: float = 0.0) -> Optional[dict]:
         try:
-            o = await self._call(self.exchange.create_order, ccxt_sym, "market", side, qty)
-            price = float(o.get("average") or o.get("price") or 0.0)
-            if not price:
+            if side == "buy" and price > 0:
+                # Gate.io market buy requires price to calculate cost
+                o = await self._call(
+                    self.exchange.create_order,
+                    ccxt_sym, "market", side, qty, price,
+                )
+            else:
+                # Market sell — no price needed
+                o = await self._call(
+                    self.exchange.create_order,
+                    ccxt_sym, "market", side, qty,
+                )
+            filled = float(o.get("average") or o.get("price") or price or 0.0)
+            if filled <= 0:
+                print(f"[ORDER] taker_order zero fill {ccxt_sym} {side} "
+                      f"qty={qty}: {o}", flush=True)
                 return None
             return o
         except Exception as e:
-            print(f"[ORDER] taker_order failed {ccxt_sym} {side} qty={qty}: "
-                  f"{e}", flush=True)
+            print(f"[ORDER] taker_order failed {ccxt_sym} {side} "
+                  f"qty={qty}: {e}", flush=True)
             return None
 
     async def execute_signal(self, signal: Signal, stake: float) -> TradeResult:
@@ -718,7 +732,7 @@ class ExecutionEngine:
         # 3) Market fallback
         _taker_raw: Optional[dict] = None
         if filled_price is None:
-            _taker_raw = await self._taker_order(ccxt_sym, side, qty)
+            _taker_raw = await self._taker_order(ccxt_sym, side, qty, price=signal.entry_price)
             if _taker_raw is None:
                 return self._missed(signal, stake, "sor_no_fill")
             filled_price = float(_taker_raw.get("average") or _taker_raw.get("price"))
@@ -1796,6 +1810,11 @@ class ScalperEngine:
 
     async def _process_symbol(self, symbol: str) -> None:
         """Momentum + pullback retail entry pipeline."""
+        # Early exit if max positions already filled — no point scanning
+        max_pos = int(getattr(self.cfg, "slot_count", self.cfg.max_open_positions))
+        if self._state.count() >= max_pos:
+            return
+
         if not self._warmup_ready():
             return
         if time.time() - self._last_ws_ok > EXCHANGE_TIMEOUT_SEC:
