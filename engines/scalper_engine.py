@@ -1809,7 +1809,7 @@ class ScalperEngine:
             return
         # Do not enter if ATR is so small that even a 1.3× dynamic SL would be
         # narrower than the raw noise floor (0.20% bilateral commission).
-        _min_viable_sl = (MAKER_FEE + TAKER_FEE) * 2.0   # 2× round-trip fee
+        _min_viable_sl = (MAKER_FEE + TAKER_FEE) * 1.0   # jedna strona round-trip
         if atr_1m_pct * 1.3 < _min_viable_sl:
             if _dbg_throttle:
                 self._debug_last_print[symbol] = time.time()

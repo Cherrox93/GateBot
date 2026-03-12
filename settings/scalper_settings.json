@@ -17,7 +17,7 @@
   "symbol_cooldown_sec": 120.0,
   "momentum_min_change": 0.0034999999999999996,
   "volume_spike_mult": 2.0,
-  "atr_filter_min": 0.0030,
+  "atr_filter_min": 0.0010,
   "pullback_min_retrace": 0.25,
   "pullback_max_retrace": 0.4,
   "impulse_ttl_sec": 20.0,
