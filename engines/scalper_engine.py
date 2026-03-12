@@ -577,7 +577,9 @@ class ExecutionEngine:
                 ccxt_sym, "limit", side, qty, price,
                 {"postOnly": True, "timeInForce": "PO"},
             )
-        except Exception:
+        except Exception as e:
+            print(f"[ORDER] post_only failed {ccxt_sym} {side} qty={qty} "
+                  f"price={price}: {e}", flush=True)
             return None
 
     async def _limit_order(
@@ -589,7 +591,9 @@ class ExecutionEngine:
                 ccxt_sym, "limit", side, qty, price,
                 {"timeInForce": "GTC"},
             )
-        except Exception:
+        except Exception as e:
+            print(f"[ORDER] limit_order failed {ccxt_sym} {side} qty={qty} "
+                  f"price={price}: {e}", flush=True)
             return None
 
     async def _fetch_order_safe(self, ccxt_sym: str, order_id: str) -> Optional[dict]:
@@ -650,7 +654,9 @@ class ExecutionEngine:
             if not price:
                 return None
             return o
-        except Exception:
+        except Exception as e:
+            print(f"[ORDER] taker_order failed {ccxt_sym} {side} qty={qty}: "
+                  f"{e}", flush=True)
             return None
 
     async def execute_signal(self, signal: Signal, stake: float) -> TradeResult:
@@ -662,9 +668,11 @@ class ExecutionEngine:
         """
         ccxt_sym = self._ccxt(signal.symbol)
         side = "buy" if signal.direction == 1 else "sell"
-        qty = round(stake / signal.entry_price, 8)
+        qty = round(stake / signal.entry_price, 6)  # Gate.io max 6 decimals
         if qty <= 0:
             return self._missed(signal, stake, "qty_zero")
+        print(f"[ORDER] Attempting {signal.symbol} {side} qty={qty} "
+              f"stake={stake} price={signal.entry_price}", flush=True)
         entry_start = time.time()
 
         # 1) Maker slightly inside spread (retail-safe, still post-only)
@@ -1930,25 +1938,13 @@ class ScalperEngine:
                   f"trend_dir={trend_dir} "
                   f"trend_required={trend_required}", flush=True)
 
-        # Fetch balance once before processing signals (avoid rate limit)
-        if signals:
-            try:
-                loop = asyncio.get_running_loop()
-                _bal = await loop.run_in_executor(
-                    None, lambda: self.exchange_client.fetch_balance()
-                )
-                self.balance_usdt = float(_bal.get("USDT", {}).get("free", 0.0))
-            except Exception:
-                pass  # keep last known balance_usdt
-
         for signal in signals:
+            # 1. Non-async guards (safe — no await, no race)
             now = time.time()
-            retry_ts = self._retry_after.get(signal.symbol, 0.0)
-            if now < retry_ts:
+            if now < self._retry_after.get(signal.symbol, 0.0):
                 if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: retry_cooldown", flush=True)
                 continue
-            last_trade = self._last_trade_ts.get(signal.symbol, 0.0)
-            if now - last_trade < self.symbol_cooldown_sec:
+            if now - self._last_trade_ts.get(signal.symbol, 0.0) < self.symbol_cooldown_sec:
                 if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: symbol_cooldown", flush=True)
                 continue
             if signal.symbol in self._pending_orders:
@@ -1958,7 +1954,7 @@ class ScalperEngine:
                 if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: max_pending_orders", flush=True)
                 continue
 
-            # ── ML pre-trade checks ──
+            # ML guards (no await)
             adj = self.analytics.get_adjustment()
             if adj.trading_blocked:
                 if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: ml_blocked reason={adj.block_reason}", flush=True)
@@ -1967,24 +1963,13 @@ class ScalperEngine:
                 if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: symbol_blocked", flush=True)
                 continue
 
-            balance_now = self.balance_usdt
-            stake = self._calc_effective_stake()
-            if balance_now < stake:
-                stake = balance_now
-            if stake <= 0:
-                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: no_balance bal={balance_now:.2f}", flush=True)
-                continue
-            max_pos = int(getattr(self.cfg, "slot_count", self.cfg.max_open_positions))
-            if adj.max_positions_override is not None:
-                max_pos = min(max_pos, adj.max_positions_override)
-            avail = balance_now
-
+            # Rate limit (no await)
             while self._trade_rate_window and now - self._trade_rate_window[0] > 1.0:
                 self._trade_rate_window.popleft()
             if len(self._trade_rate_window) >= int(max(float(self.cfg.max_trade_rate_per_sec), 1.0)):
                 continue
 
-            # Apply ML score adjustment to signal strength check
+            # ML score check (no await)
             effective_strength = signal.strength * 100.0
             score_delta = adj.min_score_delta
             entry_quality = adj.entry_quality_score
@@ -1992,42 +1977,71 @@ class ScalperEngine:
             if effective_strength < effective_threshold:
                 continue
 
-            ok, reason = self._filter.should_trade(
-                signal, self._state, avail, max_pos,
-                self._state.trades_today, self._daily_limit_hit(), stake,
-            )
-            if not ok:
-                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: filter {reason}", flush=True)
-                continue
-
-            # Net R:R guard: reject signal if expected net reward < 1.0× expected net risk.
-            _atr_now = self._cache.get_atr_1m_pct(signal.symbol)
-            _eff_sl = max(_atr_now * 1.3, STOP_LOSS_PCT)
-            _net_reward = signal.tp_pct - (MAKER_FEE + TAKER_FEE)
-            _net_risk   = _eff_sl      + (MAKER_FEE + TAKER_FEE)
-            if _net_risk <= 0 or (_net_reward / _net_risk) < 1.0:
-                self.log(
-                    f"[{signal.symbol}] RR_SKIP net_reward={_net_reward:.5f}"
-                    f" net_risk={_net_risk:.5f} ratio={_net_reward/_net_risk if _net_risk>0 else 0:.2f}"
-                )
-                continue
+            # 2. ATOMIC SLOT CLAIM — must happen before any await
+            max_pos = int(getattr(self.cfg, "slot_count", self.cfg.max_open_positions))
+            if adj.max_positions_override is not None:
+                max_pos = min(max_pos, adj.max_positions_override)
 
             placeholder = OpenPosition(
                 symbol=signal.symbol, direction=signal.direction,
                 entry_price=signal.entry_price, tp_price=signal.tp_price,
-                sl_price=signal.sl_price, qty=0.0, stake=stake,
+                sl_price=signal.sl_price, sl_pct=float(self.cfg.stop_loss_pct),
+                qty=0.0, stake=0.0,
                 entry_time=time.time(), entry_order_id="pending",
                 tp_order_id=None, strategy=signal.strategy,
             )
             reserved, reserve_reason = self._state.reserve(placeholder, max_pos)
             if not reserved:
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: reserve {reserve_reason}", flush=True)
                 continue
 
-            self.balance_usdt -= stake  # optimistic local tracking
+            # 3. Balance fetch (await — now safe, slot already claimed)
+            try:
+                loop = asyncio.get_running_loop()
+                _bal = await loop.run_in_executor(
+                    None, lambda: self.exchange_client.fetch_balance()
+                )
+                balance_now = float(_bal.get("USDT", {}).get("free", 0.0))
+                self.balance_usdt = balance_now
+            except Exception:
+                balance_now = self.balance_usdt
 
+            stake = self._calc_effective_stake()
+            if balance_now < stake:
+                stake = balance_now
+            if stake <= 0:
+                self._state.remove(signal.symbol)
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: no_balance bal={balance_now:.2f}", flush=True)
+                continue
+
+            # 4. Remaining filter checks (balance already known)
+            if self._state.trades_today >= MAX_TRADES_DAY:
+                self._state.remove(signal.symbol)
+                continue
+            if signal.strength < self._filter.MIN_STRENGTH:
+                self._state.remove(signal.symbol)
+                continue
+            if self._daily_limit_hit():
+                self._state.remove(signal.symbol)
+                continue
+
+            # 5. R:R guard
+            _atr_now = self._cache.get_atr_1m_pct(signal.symbol)
+            _eff_sl = max(_atr_now * 1.3, STOP_LOSS_PCT)
+            _net_reward = signal.tp_pct - (MAKER_FEE + TAKER_FEE)
+            _net_risk   = _eff_sl      + (MAKER_FEE + TAKER_FEE)
+            if _net_risk <= 0 or (_net_reward / _net_risk) < 1.0:
+                self._state.remove(signal.symbol)
+                self.log(
+                    f"[{signal.symbol}] RR_SKIP ratio="
+                    f"{_net_reward/_net_risk if _net_risk>0 else 0:.2f}"
+                )
+                continue
+
+            # 6. Proceed — slot claimed, balance checked, all filters passed
+            self.balance_usdt -= stake  # optimistic local tracking
             self._pending_orders.add(signal.symbol)
             self._trade_rate_window.append(now)
-            # Collect ML features and pass to execute
             ml_features = self._collect_ml_features(signal.symbol, signal, features, snapshot)
             self._log_signal(signal, stake)
             asyncio.create_task(self._execute_and_record(signal, stake, ml_features))
