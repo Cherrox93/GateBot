@@ -3,7 +3,7 @@ engines/scalper_engine.py — Scalping Engine for Gate.io Spot.
 
 Symbols : BTC_USDT, ETH_USDT, SOL_USDT
 Strategy: WebSocket orderbook + trades feed → features → signals → maker-first execution
-Interface: matches project pattern (cfg, log_callback, market_data, tg, portfolio)
+Interface: matches project pattern (cfg, log_callback, market_data, tg)
 """
 
 from __future__ import annotations
@@ -161,7 +161,7 @@ class TradeResult:
 
 
 # ============================================================
-#   BOT STATE  (positions only — balance is in portfolio)
+#   BOT STATE  (positions only — balance from exchange)
 # ============================================================
 
 class _BotState:
@@ -545,6 +545,8 @@ class ExecutionEngine:
     """
 
     RUNNER_TRAIL_PCT: float = 0.0010
+    BE_TRIGGER_PCT:  float = 0.0020   # +0.20% gross → activate break-even
+    BE_BUFFER_PCT:   float = 0.0021   # BE SL at entry*(1+0.21%) — covers round-trip fee + buffer
 
     def __init__(
         self,
@@ -820,15 +822,20 @@ class ExecutionEngine:
         exit_price = pos.entry_price
         exit_fee_cost = 0.0
         exit_fee_currency = "USDT"
-        peak_net_pnl = 0.0
         _last_pos_broadcast = 0.0
         # MFE/MAE tracking (gross pnl extremes)
         _max_favorable = 0.0
         _max_adverse = 0.0
-        # Runner state
+        # Runner state (Phase 3)
         runner_active: bool = False
         runner_sl: float = 0.0
         runner_peak: float = 0.0
+        # Break-even state (Phase 2)
+        be_active: bool = False
+        be_sl_price: float = 0.0
+
+        BE_TRIGGER = self.BE_TRIGGER_PCT
+        BE_BUFFER  = self.BE_BUFFER_PCT
 
         while True:
             # a) sleep
@@ -858,11 +865,8 @@ class ExecutionEngine:
                 except Exception:
                     pass
 
-            # e) calc gross_pnl and net_pnl
+            # e) calc gross_pnl
             gross_pnl = (current / pos.entry_price - 1.0) * pos.direction
-            # net_pnl here is an estimate for trigger logic only
-            # actual fee is recorded at exit from exchange data
-            net_pnl = gross_pnl - (MAKER_FEE + TAKER_FEE)
 
             # Track MFE/MAE (gross)
             if gross_pnl > _max_favorable:
@@ -870,7 +874,7 @@ class ExecutionEngine:
             if gross_pnl < 0 and abs(gross_pnl) > _max_adverse:
                 _max_adverse = abs(gross_pnl)
 
-            # f) RUNNER block — if runner already active
+            # f) RUNNER block — Phase 3 active
             if runner_active:
                 runner_peak = max(runner_peak, current)
                 runner_trail_sl = runner_peak * (1.0 - self.RUNNER_TRAIL_PCT)
@@ -895,32 +899,55 @@ class ExecutionEngine:
                     flush=True,
                 )
 
-            # h) RUNNER activation — gross profit reached target
+            # h) RUNNER activation — Phase 2→3 transition
             if gross_pnl >= TARGET_PROFIT_PCT:
                 runner_active = True
                 runner_sl = pos.tp_price
                 runner_peak = current
                 print(
-                    f"[{pos.symbol}] RUNNER aktywny peak={current:.6f}"
-                    f" sl_lock={pos.tp_price:.6f}",
+                    f"[{pos.symbol}] 🚀 RUNNER aktywny "
+                    f"peak={current:.6f} "
+                    f"sl_lock={pos.tp_price:.6f}",
                     flush=True,
                 )
-                continue  # don't sell, go to next iteration
+                continue
 
-            # i) Trailing stop — only when net_pnl > 0 and TRAILING enabled
-            if TRAILING_STOP_PCT > 0 and net_pnl > 0:
-                peak_net_pnl = max(peak_net_pnl, net_pnl)
-                if peak_net_pnl - net_pnl >= TRAILING_STOP_PCT:
+            # i) BREAK-EVEN block — Phase 2 active
+            if be_active:
+                if current * pos.direction <= be_sl_price * pos.direction:
                     if pos.tp_order_id:
                         await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
                     _exit_order = await self._market_sell(pos, ccxt_sym)
                     exit_price = _exit_order["price"]
                     exit_fee_cost = _exit_order["fee_cost"]
                     exit_fee_currency = _exit_order["fee_currency"]
-                    exit_reason = "TRAIL"
+                    exit_reason = "BE"
                     break
+                # BE active but price above BE SL — check backup SL for flash crash
+                if gross_pnl <= -pos.sl_pct:
+                    if pos.tp_order_id:
+                        await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
+                    _exit_order = await self._market_sell(pos, ccxt_sym)
+                    exit_price = _exit_order["price"]
+                    exit_fee_cost = _exit_order["fee_cost"]
+                    exit_fee_currency = _exit_order["fee_currency"]
+                    exit_reason = "SL"
+                    break
+                continue
 
-            # j) SL check — uses gross (no fee in trigger), dynamic per-position
+            # j) BREAK-EVEN activation — Phase 1→2 transition
+            if gross_pnl >= BE_TRIGGER:
+                be_active = True
+                be_sl_price = pos.entry_price * (1.0 + BE_BUFFER * pos.direction)
+                print(
+                    f"[{pos.symbol}] 🛡️ BREAK-EVEN aktywny "
+                    f"be_sl={be_sl_price:.6f} "
+                    f"current={current:.6f}",
+                    flush=True,
+                )
+                continue
+
+            # k) Normal SL — Phase 1 (before BE activation)
             if gross_pnl <= -pos.sl_pct:
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
@@ -930,7 +957,6 @@ class ExecutionEngine:
                 exit_fee_currency = _exit_order["fee_currency"]
                 exit_reason = "SL"
                 break
-
 
         return self._build_result(pos, exit_price, exit_reason, fill_latency_sec,
                                   exit_fee_cost=exit_fee_cost, exit_fee_currency=exit_fee_currency,
@@ -977,7 +1003,8 @@ class ExecutionEngine:
 class ScalperEngine:
     """
     Scalping engine for BTC/ETH/SOL.
-    Interface matches other project engines (cfg, log_callback, market_data, tg, portfolio).
+    Interface matches other project engines (cfg, log_callback, market_data, tg).
+    Live trading only — balance fetched from Gate.io, no paper simulation.
     """
 
     def __init__(
@@ -986,7 +1013,7 @@ class ScalperEngine:
         log_callback=None,
         market_data: Optional[MarketData] = None,
         tg=None,
-        portfolio=None,
+        portfolio=None,       # accepted for interface compat, ignored
     ) -> None:
         global MAKER_FEE, TAKER_FEE, MAX_TRADES_DAY, PAIR_REFRESH_SEC
         global WS_RECONNECT_MAX, WS_RECONNECT_BASE, EXCHANGE_TIMEOUT_SEC
@@ -1013,8 +1040,6 @@ class ScalperEngine:
         self.log_callback = log_callback
         self.market_data = market_data      # kept for compatibility; engine uses own WS
         self.tg = tg
-        # portfolio parameter kept for interface compatibility — not used in live mode
-        self.portfolio = portfolio
 
         # Analytics
         self.analytics = get_analytics('scalper')
@@ -1067,23 +1092,211 @@ class ScalperEngine:
         self._impulses: dict[str, dict] = {}
 
         # Stats (exposed for /status and main_web.py)
-        # Fetch real balance at init so dashboard shows correct value immediately
+        # Balance from exchange — cached for max 2s to avoid API spam
+        self._balance_cache: float = 0.0
+        self._balance_cache_ts: float = 0.0
         try:
             _init_bal = self.exchange_client.fetch_balance()
-            self.balance_usdt = float(_init_bal.get("USDT", {}).get("free", 0.0))
+            self._balance_cache = float(_init_bal.get("USDT", {}).get("free", 0.0))
+            self._balance_cache_ts = time.time()
         except Exception:
-            self.balance_usdt = cfg.start_balance
-        self.realized_profit = 0.0
-        self.daily_realized = 0.0
-        self.session_profit: float = 0.0
+            self._balance_cache = cfg.start_balance
+        # Trade stats — fetched from Gate.io API, cached 30s
+        self._stats_cache: dict = {}
+        self._stats_cache_ts: float = 0.0
+        self._stats_cache_ttl: float = 30.0
+        self._session_start_time: float = time.time()
         self._day_start = datetime.now().date()
-        self.wins = 0
-        self.losses = 0
         self._debug_last_print: dict[str, float] = {}
         self._exec_attempts = 0
         self._exec_fills = 0
         self._exec_missed = 0
         self._exec_fill_latencies: deque[float] = deque(maxlen=500)
+
+    # ── Balance — always from exchange, cached 2s ─────────────────────────────
+
+    @property
+    def balance_usdt(self) -> float:
+        """Read-only for dashboard / main_web.py — returns cached exchange balance."""
+        return self._balance_cache
+
+    @balance_usdt.setter
+    def balance_usdt(self, value: float) -> None:
+        """Allow direct assignment for backward compat (e.g. _run startup)."""
+        self._balance_cache = value
+        self._balance_cache_ts = time.time()
+
+    async def _get_available_balance(self) -> float:
+        """Fetch available USDT from Gate.io with 2s cache."""
+        now = time.time()
+        if now - self._balance_cache_ts < 2.0:
+            return self._balance_cache
+        try:
+            loop = asyncio.get_running_loop()
+            bal = await loop.run_in_executor(
+                None, lambda: self.exchange_client.fetch_balance()
+            )
+            result = float(bal.get("USDT", {}).get("free", 0.0))
+            self._balance_cache = result
+            self._balance_cache_ts = now
+            return result
+        except Exception as e:
+            self.log(f"[BALANCE] Błąd fetch_balance: {e}")
+            return self._balance_cache
+
+    def _invalidate_balance_cache(self) -> None:
+        """Force next _get_available_balance() to fetch fresh from exchange."""
+        self._balance_cache_ts = 0.0
+
+    # ── Trade stats from Gate.io API ──────────────────────────────────────────
+
+    async def _fetch_trade_stats(self) -> dict:
+        """Fetch real trading stats from Gate.io. Cached for 30s."""
+        now = time.time()
+        if self._stats_cache and now - self._stats_cache_ts < self._stats_cache_ttl:
+            return self._stats_cache
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            # 1) Real balance
+            balance_data = await loop.run_in_executor(
+                None, lambda: self.exchange_client.fetch_balance()
+            )
+            usdt_free = float(balance_data.get("USDT", {}).get("free", 0.0))
+            usdt_total = float(balance_data.get("USDT", {}).get("total", 0.0))
+
+            # 2) Trade history from exchange (since session start)
+            since_ms = int(self._session_start_time * 1000)
+            all_trades = []
+            for symbol in self._symbols:
+                try:
+                    ccxt_sym = symbol.replace("_", "/")
+                    trades = await loop.run_in_executor(
+                        None,
+                        lambda s=ccxt_sym: self.exchange_client.fetch_my_trades(
+                            s, since=since_ms, limit=100
+                        )
+                    )
+                    all_trades.extend(trades)
+                except Exception:
+                    pass
+
+            # 3) Compute stats from real data
+            buys = [t for t in all_trades if t.get("side") == "buy"]
+            sells = [t for t in all_trades if t.get("side") == "sell"]
+
+            total_fee = sum(
+                float(t.get("fee", {}).get("cost", 0.0)) for t in all_trades
+            )
+            sell_value = sum(float(t.get("cost", 0.0)) for t in sells)
+            buy_value = sum(float(t.get("cost", 0.0)) for t in buys)
+            session_pnl = sell_value - buy_value - total_fee
+
+            # Daily PnL (trades from today only)
+            today_start = datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp() * 1000
+            today_trades = [
+                t for t in all_trades
+                if float(t.get("timestamp", 0)) >= today_start
+            ]
+            today_sells = [t for t in today_trades if t.get("side") == "sell"]
+            today_buys = [t for t in today_trades if t.get("side") == "buy"]
+            today_fee = sum(
+                float(t.get("fee", {}).get("cost", 0.0)) for t in today_trades
+            )
+            daily_pnl = (
+                sum(float(t.get("cost", 0.0)) for t in today_sells)
+                - sum(float(t.get("cost", 0.0)) for t in today_buys)
+                - today_fee
+            )
+
+            # Wins/losses: compare sell price vs last buy of same symbol
+            wins = 0
+            losses = 0
+            for sell in sells:
+                sym = sell.get("symbol")
+                matching_buys = [
+                    b for b in buys
+                    if b.get("symbol") == sym
+                    and float(b.get("timestamp", 0)) < float(sell.get("timestamp", 0))
+                ]
+                if matching_buys:
+                    last_buy = max(matching_buys, key=lambda b: float(b.get("timestamp", 0)))
+                    if float(sell.get("price", 0)) > float(last_buy.get("price", 0)):
+                        wins += 1
+                    else:
+                        losses += 1
+
+            total_trades = wins + losses
+            win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
+
+            stats = {
+                "bot": "scalper",
+                "usdt_free": round(usdt_free, 2),
+                "usdt_total": round(usdt_total, 2),
+                "session_pnl": round(session_pnl, 4),
+                "daily_pnl": round(daily_pnl, 4),
+                "total_fee_paid": round(total_fee, 4),
+                "wins": wins,
+                "losses": losses,
+                "total_trades": total_trades,
+                "win_rate": win_rate,
+                "effective_stake": self._calc_effective_stake(),
+                "open_positions": self._state.count(),
+                "last_updated": datetime.now().strftime("%H:%M:%S"),
+            }
+
+            self._stats_cache = stats
+            self._stats_cache_ts = now
+            return stats
+
+        except Exception as e:
+            self.log(f"[STATS] Błąd pobierania statystyk: {e}")
+            return self._stats_cache or {
+                "bot": "scalper",
+                "usdt_free": 0.0, "usdt_total": 0.0,
+                "session_pnl": 0.0, "daily_pnl": 0.0, "total_fee_paid": 0.0,
+                "wins": 0, "losses": 0, "total_trades": 0, "win_rate": 0.0,
+                "effective_stake": self._calc_effective_stake(),
+                "open_positions": self._state.count(),
+                "last_updated": "błąd",
+            }
+
+    async def _fetch_real_pnl(
+        self, symbol: str, entry_price: float, qty: float, after_ts: float,
+    ) -> float | None:
+        """Fetch real net PnL from last SELL trade on Gate.io.
+        Returns float if successful, None on API error (caller uses fallback).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            ccxt_sym = symbol.replace("_", "/")
+            since_ms = int(after_ts * 1000)
+
+            trades = await loop.run_in_executor(
+                None,
+                lambda: self.exchange_client.fetch_my_trades(
+                    ccxt_sym, since=since_ms, limit=10,
+                )
+            )
+            if not trades:
+                return None
+
+            sell_trades = [t for t in trades if t.get("side") == "sell"]
+            if not sell_trades:
+                return None
+
+            last_sell = max(sell_trades, key=lambda t: float(t.get("timestamp", 0)))
+            real_sell_price = float(last_sell.get("price", 0.0))
+            real_fee = float(last_sell.get("fee", {}).get("cost", 0.0))
+            real_pnl = (real_sell_price - entry_price) * qty - real_fee
+            return round(real_pnl, 2)
+
+        except Exception as e:
+            self.log(f"[REAL PnL] Błąd dla {symbol}: {e}")
+            return None
 
     def apply_cfg_globals(self) -> None:
         """Propagate cfg values to module-level globals and instance vars."""
@@ -1096,8 +1309,10 @@ class ScalperEngine:
         MAKER_FEE = float(self.cfg.maker_fee)
         TAKER_FEE = float(self.cfg.taker_fee)
         MAX_TRADES_DAY = int(self.cfg.max_trades_day)
-        # Sync Runner trail to executor
+        # Sync Runner/BE to executor
         self._executor.RUNNER_TRAIL_PCT = float(self.cfg.runner_trail_pct)
+        self._executor.BE_TRIGGER_PCT   = float(self.cfg.be_trigger_pct)
+        self._executor.BE_BUFFER_PCT    = float(self.cfg.be_buffer_pct)
         # Sync instance vars set from cfg in __init__
         self.symbol_cooldown_sec = float(self.cfg.symbol_cooldown_sec)
         self.max_position_size_usdt = float(self.cfg.max_position_size_usdt)
@@ -1120,23 +1335,22 @@ class ScalperEngine:
 
     @property
     def bot_profit_summary(self) -> dict:
-        total = self.wins + self.losses
-        return {
+        """Return last cached stats (synchronous)."""
+        return self._stats_cache or {
             "bot": "scalper",
-            "session_profit": round(self.session_profit, 4),
-            "realized_profit": round(self.realized_profit, 4),
-            "daily_profit": round(self.daily_realized, 4),
-            "wins": self.wins,
-            "losses": self.losses,
-            "win_rate": round(self.wins / max(total, 1) * 100, 1),
+            "usdt_free": 0.0, "session_pnl": 0.0, "daily_pnl": 0.0,
+            "wins": 0, "losses": 0, "win_rate": 0.0,
             "effective_stake": self._calc_effective_stake(),
+            "open_positions": self._state.count(),
+            "last_updated": "ładowanie...",
         }
 
     def _calc_effective_stake(self) -> float:
         """Effective stake with optional reinvest from session profit."""
         if not self.cfg.reinvest_enabled:
             return float(self.cfg.base_stake_usdt)
-        reinvest_pool = max(self.session_profit, 0.0) * float(self.cfg.reinvest_max_stake)
+        session_pnl = self._stats_cache.get("session_pnl", 0.0)
+        reinvest_pool = max(session_pnl, 0.0) * float(self.cfg.reinvest_max_stake)
         open_slots = max(self._state.count(), 1)
         reinvest_per_slot = reinvest_pool / open_slots
         effective = float(self.cfg.base_stake_usdt) + reinvest_per_slot
@@ -1201,14 +1415,14 @@ class ScalperEngine:
         return ""
 
     def _get_status_text(self) -> str:
-        bal = self.balance_usdt
-        total = self.wins + self.losses
-        wr = f"{self.wins / total * 100:.0f}" if total > 0 else "0"
+        stats = self._stats_cache or {}
+        bal = stats.get("usdt_free", self.balance_usdt)
         lines = [
             "📊 *SCALPER*",
             "━━━━━━━━━━━━━━━━━",
-            f"💰 Balance: *{bal:.2f}$*",
-            f"📊 Win Rate: W:{self.wins}/L:{self.losses} ({wr}%)",
+            f"💰 Saldo: *{bal:.2f}$*",
+            f"📈 Sesja: *{stats.get('session_pnl', 0.0):+.2f}$*",
+            f"📊 {self._wr_text()}",
             f"🔓 Otwarte pozycje ({self._state.count()}):",
         ]
         for sym, pos_dict in self.active_positions.items():
@@ -1221,7 +1435,6 @@ class ScalperEngine:
         today = datetime.now().date()
         if today != self._day_start:
             self._day_start = today
-            self.daily_realized = 0.0
             self._state.trades_today = 0
 
     def is_market_volatile(self, symbol: str) -> bool:
@@ -1324,7 +1537,8 @@ class ScalperEngine:
 
     def _daily_limit_hit(self) -> bool:
         limit = -self.cfg.start_balance * self.cfg.daily_loss_limit_pct
-        return self.daily_realized <= limit
+        daily_pnl = self._stats_cache.get("daily_pnl", 0.0)
+        return daily_pnl <= limit
 
     # ── ML Feature Collection (v3) ──────────────────────────────────────────
 
@@ -1484,10 +1698,13 @@ class ScalperEngine:
         return f
 
     def _wr_text(self) -> str:
-        total = self.wins + self.losses
-        if total == 0:
+        stats = self._stats_cache
+        if not stats:
             return "W:0 L:0"
-        return f"W:{self.wins} L:{self.losses} WR:{self.wins / total * 100:.0f}%"
+        w = stats.get("wins", 0)
+        l = stats.get("losses", 0)
+        wr = stats.get("win_rate", 0.0)
+        return f"W:{w} L:{l} WR:{wr:.0f}%"
 
     def _warmup_ready(self) -> bool:
         if not self.market_data:
@@ -1668,29 +1885,18 @@ class ScalperEngine:
         await self._tg(start_msg)
 
         # Verify API connectivity and fetch real balance before starting
-        try:
-            loop = asyncio.get_running_loop()
-            balance_raw = await loop.run_in_executor(
-                None, lambda: self.exchange_client.fetch_balance()
-            )
-            usdt_free = float(balance_raw.get("USDT", {}).get("free", 0.0))
-            if usdt_free <= 0:
-                msg = "⛔ SCALPER: Brak środków USDT na koncie Gate.io — bot zatrzymany"
-                self.log(msg)
-                await self._tg(msg)
-                self.running = False
-                return
-            self.balance_usdt = usdt_free
-            msg = f"✅ SCALPER LIVE: Połączono z Gate.io | USDT free: {usdt_free:.2f}$"
-            self.log(msg)
-            self.gui_log(msg)
-            await self._tg(msg)
-        except Exception as e:
-            msg = f"⛔ SCALPER: Błąd połączenia z Gate.io: {e}"
+        self._invalidate_balance_cache()
+        usdt_free = await self._get_available_balance()
+        if usdt_free <= 0:
+            msg = "⛔ SCALPER: Brak środków USDT na koncie Gate.io — bot zatrzymany"
             self.log(msg)
             await self._tg(msg)
             self.running = False
             return
+        msg = f"✅ SCALPER LIVE: Połączono z Gate.io | USDT free: {usdt_free:.2f}$"
+        self.log(msg)
+        self.gui_log(msg)
+        await self._tg(msg)
 
         await self._recover_open_positions()
 
@@ -2040,22 +2246,15 @@ class ScalperEngine:
                 continue
 
             # 3. Balance fetch (await — now safe, slot already claimed)
-            try:
-                loop = asyncio.get_running_loop()
-                _bal = await loop.run_in_executor(
-                    None, lambda: self.exchange_client.fetch_balance()
-                )
-                balance_now = float(_bal.get("USDT", {}).get("free", 0.0))
-                self.balance_usdt = balance_now
-            except Exception:
-                balance_now = self.balance_usdt
+            balance_now = await self._get_available_balance()
 
             stake = self._calc_effective_stake()
             if balance_now < stake:
                 stake = balance_now
-            if stake <= 0:
+            min_stake = float(self.cfg.base_stake_usdt) * 0.95
+            if stake < min_stake:
                 self._state.remove(signal.symbol)
-                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: no_balance bal={balance_now:.2f}", flush=True)
+                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: stake {stake:.2f}$ < min {min_stake:.2f}$ bal={balance_now:.2f}", flush=True)
                 continue
 
             # 4. Remaining filter checks (balance already known)
@@ -2083,7 +2282,7 @@ class ScalperEngine:
                 continue
 
             # 6. Proceed — slot claimed, balance checked, all filters passed
-            self.balance_usdt -= stake  # optimistic local tracking
+            self._invalidate_balance_cache()  # force fresh fetch on next check
             self._pending_orders.add(signal.symbol)
             self._trade_rate_window.append(now)
             ml_features = self._collect_ml_features(signal.symbol, signal, features, snapshot)
@@ -2092,7 +2291,7 @@ class ScalperEngine:
 
     async def _execute_and_record(self, signal: Signal, stake: float,
                                    ml_features: dict | None = None) -> None:
-        """Execute signal, manage portfolio balance, log result."""
+        """Execute signal, log result. Balance managed by exchange."""
         # ── Analytics entry ──
         _features_map = ml_features or {
             "score": round(signal.strength * 100),
@@ -2116,7 +2315,6 @@ class ScalperEngine:
             self._state.remove(signal.symbol)
             self._pending_orders.discard(signal.symbol)
             self._trade_ids.pop(signal.symbol, None)
-            self.balance_usdt += stake  # refund local tracking
             return
 
         # ── ML position sizing ──
@@ -2124,15 +2322,6 @@ class ScalperEngine:
         if size_mult != 1.0:
             old_stake = stake
             stake = round(stake * size_mult, 2)
-            diff = stake - old_stake
-            # Adjust local balance tracking
-            if diff > 0:
-                if self.balance_usdt >= diff:
-                    self.balance_usdt -= diff
-                else:
-                    stake = old_stake
-            elif diff < 0:
-                self.balance_usdt += abs(diff)
             if stake != old_stake:
                 self.log(f"[{signal.symbol}] ML size adjust: ${old_stake:.2f} → ${stake:.2f} "
                          f"(x{size_mult:.2f})")
@@ -2154,8 +2343,7 @@ class ScalperEngine:
             self._state.remove(signal.symbol)
             self._trade_ids.pop(signal.symbol, None)
             self._retry_after[signal.symbol] = time.time() + MISSED_RETRY_COOLDOWN_SEC
-            # refund local tracking
-            self.balance_usdt += stake
+            self._invalidate_balance_cache()
             self._pending_orders.discard(signal.symbol)
             self._last_trade_ts[signal.symbol] = time.time()
             return
@@ -2165,8 +2353,6 @@ class ScalperEngine:
 
         if result.exit_reason == "MISSED":
             self._retry_after[signal.symbol] = time.time() + MISSED_RETRY_COOLDOWN_SEC
-            # refund local tracking
-            self.balance_usdt += stake
             self._trade_ids.pop(signal.symbol, None)
             self.log(f"[{signal.symbol}] [{signal.strategy}] MISSED")
             self._record_execution_metrics(result)
@@ -2176,33 +2362,53 @@ class ScalperEngine:
 
         self._state.trades_today += 1
 
-        # Return stake + net P&L — local tracking, real balance refreshed at next cycle
-        net_pnl = result.pnl_usd - result.fee_paid
-        sell_value = stake + net_pnl
-        self.balance_usdt += sell_value
+        # Real PnL from exchange (fallback to local calculation)
+        _real_pnl = await self._fetch_real_pnl(
+            symbol=signal.symbol,
+            entry_price=result.entry_price,
+            qty=result.stake / result.entry_price if result.entry_price > 0 else 0,
+            after_ts=result.timestamp - result.duration,
+        )
+        net_pnl = _real_pnl if _real_pnl is not None \
+            else round(result.pnl_usd - result.fee_paid, 2)
 
-        self.realized_profit += net_pnl
-        self.daily_realized  += net_pnl
-        self.session_profit  += net_pnl
-        if net_pnl >= 0:
-            self.wins += 1
-        else:
-            self.losses += 1
+        self._invalidate_balance_cache()  # force fresh balance on next check
+        self._stats_cache_ts = 0.0        # invalidate stats cache — force refresh
 
-        # ── Analytics exit (with MFE/MAE) ──
+        # ── Analytics exit (with MFE/MAE) — uses local calculation, not exchange ──
+        _local_pnl = result.pnl_usd - result.fee_paid
         _tid = self._trade_ids.pop(signal.symbol, None)
         if _tid:
             self.analytics.on_exit(
                 trade_id=_tid,
                 exit_reason=result.exit_reason,
-                pnl=net_pnl,
-                pnl_pct=net_pnl / stake if stake > 0 else 0,
+                pnl=_local_pnl,
+                pnl_pct=_local_pnl / stake if stake > 0 else 0,
                 mfe=getattr(result, 'mfe', 0.0),
                 mae=getattr(result, 'mae', 0.0),
             )
 
         # Log in project-standard format (make_log_callback parses "SELL" + "PnL:")
-        icon = "✅" if net_pnl >= 0 else "❌"
+        # Warn if SL exit with ~zero PnL (may indicate failed sell)
+        if result.exit_reason == "SL" and abs(net_pnl) < 0.01:
+            self.log(
+                f"⚠️ UWAGA: SL exit z PnL≈0 dla {signal.symbol.replace('_', '/')} — "
+                f"sprawdź czy sprzedaż dotarła na giełdę! "
+                f"entry={result.entry_price} exit={result.exit_price}"
+            )
+
+        if result.exit_reason == "RUNNER":
+            icon = "🚀"
+        elif result.exit_reason in ("TP", "TP_MAKER"):
+            icon = "✅"
+        elif result.exit_reason == "BE":
+            icon = "🛡️"
+        elif result.exit_reason == "SL":
+            icon = "🔴"
+        elif result.exit_reason == "TRAIL":
+            icon = "📉"
+        else:
+            icon = "⚠️"
         sign = "+" if net_pnl >= 0 else ""
         ccxt_sym = signal.symbol.replace("_", "/")
         wr = self._wr_text()
@@ -2221,7 +2427,8 @@ class ScalperEngine:
         self._last_trade_ts[signal.symbol] = time.time()
 
         if self._daily_limit_hit():
-            msg = f"🛑 SCALPER: Dzienny limit strat — bot zatrzymany ({round(self.daily_realized, 2)}$)"
+            daily_pnl = self._stats_cache.get("daily_pnl", 0.0)
+            msg = f"🛑 SCALPER: Dzienny limit strat — bot zatrzymany ({round(daily_pnl, 2)}$)"
             self.log(msg)
             self.gui_log(msg)
             await self._tg(msg)

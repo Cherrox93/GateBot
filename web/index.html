@@ -557,7 +557,10 @@
           </div>
         </div>
         <div class="stats-row">
-          <div class="stat-item"><div class="stat-label">ZYSK / STRATA</div><div class="stat-value neu" id="stat-scalper-pnl">0.00$</div></div>
+          <div class="stat-item"><div class="stat-label">SALDO</div><div class="stat-value neu" id="stat-scalper-bal">0.00$</div></div>
+          <div class="stat-item"><div class="stat-label">SESJA PnL</div><div class="stat-value neu" id="stat-scalper-pnl">0.00$</div></div>
+          <div class="stat-item"><div class="stat-label">DZIEŃ PnL</div><div class="stat-value neu" id="stat-scalper-daily">0.00$</div></div>
+          <div class="stat-item"><div class="stat-label">FEE</div><div class="stat-value neu" id="stat-scalper-fee">0.00$</div></div>
           <div class="stat-item"><div class="stat-label">WIN RATE</div><div class="stat-value neu" id="stat-scalper-wr">0%</div></div>
           <div class="stat-item"><div class="stat-label">WYGRANE</div><div class="stat-value pos" id="stat-scalper-w">0</div></div>
           <div class="stat-item"><div class="stat-label">PRZEGRANE</div><div class="stat-value neg" id="stat-scalper-l">0</div></div>
@@ -695,6 +698,14 @@
           <div class="settings-field">
             <label>RUNNER TRAILING %</label>
             <input type="number" id="cfg-scalper-runner" step="0.01" min="0.01" max="5">
+          </div>
+          <div class="settings-field">
+            <label>BREAK-EVEN TRIGGER %</label>
+            <input type="number" id="cfg-scalper-be-trigger" step="0.01" min="0.01" max="5">
+          </div>
+          <div class="settings-field">
+            <label>BREAK-EVEN BUFFER %</label>
+            <input type="number" id="cfg-scalper-be-buffer" step="0.01" min="0.01" max="5">
           </div>
           <div class="settings-field">
             <label>DZIENNY LIMIT STRAT %</label>
@@ -939,11 +950,13 @@ function showApp() {
   loadLogs();
   connectWS();
   fetchPortfolio();
+  fetchScalperStats();
   loadSettings();
   if (!_intervalsStarted) {
     _intervalsStarted = true;
     setInterval(loadState, 30000);
     setInterval(fetchPortfolio, 15000);
+    setInterval(fetchScalperStats, 30000);
   }
 }
 
@@ -1081,6 +1094,58 @@ function updateBotUI(bot, b) {
     });
     renderScalperLivePositions();
   }
+}
+
+// ═══════════════════════════════
+//   SCALPER REAL STATS (from Gate.io API)
+// ═══════════════════════════════
+async function fetchScalperStats() {
+  try {
+    const d = await apiFetch('/api/scalper/profit');
+    if (!d || d.error) return;
+
+    // Balance
+    const balEl = document.getElementById('stat-scalper-bal');
+    if (balEl) balEl.textContent = `${d.usdt_free}$`;
+
+    // Session PnL
+    const pnlEl = document.getElementById('stat-scalper-pnl');
+    if (pnlEl) {
+      const sp = d.session_pnl || 0;
+      pnlEl.textContent = (sp >= 0 ? '+' : '') + sp.toFixed(2) + '$';
+      pnlEl.className = 'stat-value ' + (sp > 0 ? 'pos' : sp < 0 ? 'neg' : 'neu');
+    }
+
+    // Daily PnL
+    const dailyEl = document.getElementById('stat-scalper-daily');
+    if (dailyEl) {
+      const dp = d.daily_pnl || 0;
+      dailyEl.textContent = (dp >= 0 ? '+' : '') + dp.toFixed(2) + '$';
+      dailyEl.className = 'stat-value ' + (dp > 0 ? 'pos' : dp < 0 ? 'neg' : 'neu');
+    }
+
+    // Fee
+    const feeEl = document.getElementById('stat-scalper-fee');
+    if (feeEl) feeEl.textContent = (d.total_fee_paid || 0).toFixed(2) + '$';
+
+    // Win rate / wins / losses
+    const wrEl = document.getElementById('stat-scalper-wr');
+    if (wrEl) wrEl.textContent = (d.win_rate || 0) + '%';
+    const wEl = document.getElementById('stat-scalper-w');
+    if (wEl) wEl.textContent = d.wins || 0;
+    const lEl = document.getElementById('stat-scalper-l');
+    if (lEl) lEl.textContent = d.losses || 0;
+
+    // Overview card
+    const ovPnl = document.getElementById('ov-scalper-pnl');
+    if (ovPnl) {
+      const sp = d.session_pnl || 0;
+      ovPnl.textContent = (sp >= 0 ? '+' : '') + sp.toFixed(2) + '$';
+      ovPnl.style.color = sp > 0 ? 'var(--neon-g)' : sp < 0 ? 'var(--neon-r)' : 'var(--text)';
+    }
+    const ovWr = document.getElementById('ov-scalper-wr');
+    if (ovWr) ovWr.textContent = `W:${d.wins||0} L:${d.losses||0} WR:${d.win_rate||0}%`;
+  } catch(e) { /* silent */ }
 }
 
 // ═══════════════════════════════
@@ -1416,6 +1481,8 @@ const SCALPER_FIELDS = [
   {id:'cfg-scalper-tp',           key:'target_profit_pct',       pct:true},
   {id:'cfg-scalper-sl',           key:'stop_loss_pct',           pct:true},
   {id:'cfg-scalper-runner',       key:'runner_trail_pct',        pct:true},
+  {id:'cfg-scalper-be-trigger',   key:'be_trigger_pct',          pct:true},
+  {id:'cfg-scalper-be-buffer',    key:'be_buffer_pct',           pct:true},
   {id:'cfg-scalper-daily-loss',   key:'daily_loss_limit_pct',    pct:true},
   {id:'cfg-scalper-momentum',     key:'momentum_min_change',     pct:true},
   {id:'cfg-scalper-atr',          key:'atr_filter_min',          pct:true},
