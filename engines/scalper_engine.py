@@ -962,6 +962,8 @@ class ExecutionEngine:
                 continue
 
             # j) BREAK-EVEN activation — Phase 1→2 transition
+            # Place a real limit sell order on exchange at be_sl_price
+            # so the exit is guaranteed near that level, not subject to poll latency.
             if gross_pnl >= BE_TRIGGER:
                 be_active = True
                 be_sl_price = pos.entry_price * (1.0 + BE_BUFFER * pos.direction)
@@ -971,6 +973,20 @@ class ExecutionEngine:
                     f"current={current:.6f}",
                     flush=True,
                 )
+                # Cancel existing TP order — BE limit replaces it
+                if pos.tp_order_id:
+                    await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
+                    pos.tp_order_id = None
+                # Place limit sell at be_sl_price as the new exit order
+                be_side = "sell" if pos.direction == 1 else "buy"
+                _be_order = await self._limit_order(ccxt_sym, be_side, pos.qty, be_sl_price)
+                if _be_order:
+                    pos.tp_order_id = _be_order.get("id")
+                    print(
+                        f"[{pos.symbol}] 🛡️ BE limit order placed "
+                        f"price={be_sl_price:.6f} id={pos.tp_order_id}",
+                        flush=True,
+                    )
                 continue
 
             # k) Normal SL — Phase 1 (before BE activation)
@@ -1218,12 +1234,32 @@ class ScalperEngine:
             buys = [t for t in all_trades if t.get("side") == "buy"]
             sells = [t for t in all_trades if t.get("side") == "sell"]
 
-            total_fee = sum(
-                float(t.get("fee", {}).get("cost", 0.0)) for t in all_trades
-            )
-            sell_value = sum(float(t.get("cost", 0.0)) for t in sells)
-            buy_value = sum(float(t.get("cost", 0.0)) for t in buys)
-            session_pnl = sell_value - buy_value - total_fee
+            # Only count matched pairs — an unmatched BUY is an open position, not a loss.
+            matched_buy_ids: set[str] = set()
+            matched_pnl: float = 0.0
+            matched_fee: float = 0.0
+            for sell in sells:
+                sym = sell.get("symbol")
+                sell_ts = float(sell.get("timestamp", 0))
+                candidates = [
+                    b for b in buys
+                    if b.get("symbol") == sym
+                    and float(b.get("timestamp", 0)) < sell_ts
+                    and b.get("id") not in matched_buy_ids
+                ]
+                if not candidates:
+                    continue
+                matching_buy = max(candidates, key=lambda b: float(b.get("timestamp", 0)))
+                matched_buy_ids.add(matching_buy.get("id"))
+                sell_cost = float(sell.get("cost", 0.0))
+                buy_cost = float(matching_buy.get("cost", 0.0))
+                sell_fee = float(sell.get("fee", {}).get("cost", 0.0))
+                buy_fee = float(matching_buy.get("fee", {}).get("cost", 0.0))
+                matched_pnl += sell_cost - buy_cost
+                matched_fee += sell_fee + buy_fee
+
+            total_fee = matched_fee
+            session_pnl = matched_pnl - matched_fee
 
             # Daily PnL (trades from today only)
             today_start = datetime.now().replace(
@@ -1233,16 +1269,29 @@ class ScalperEngine:
                 t for t in all_trades
                 if float(t.get("timestamp", 0)) >= today_start
             ]
-            today_sells = [t for t in today_trades if t.get("side") == "sell"]
             today_buys = [t for t in today_trades if t.get("side") == "buy"]
-            today_fee = sum(
-                float(t.get("fee", {}).get("cost", 0.0)) for t in today_trades
-            )
-            daily_pnl = (
-                sum(float(t.get("cost", 0.0)) for t in today_sells)
-                - sum(float(t.get("cost", 0.0)) for t in today_buys)
-                - today_fee
-            )
+            today_sells = [t for t in today_trades if t.get("side") == "sell"]
+            today_matched_buy_ids: set[str] = set()
+            daily_pnl: float = 0.0
+            today_fee: float = 0.0
+            for sell in today_sells:
+                sym = sell.get("symbol")
+                sell_ts = float(sell.get("timestamp", 0))
+                candidates = [
+                    b for b in today_buys
+                    if b.get("symbol") == sym
+                    and float(b.get("timestamp", 0)) < sell_ts
+                    and b.get("id") not in today_matched_buy_ids
+                ]
+                if not candidates:
+                    continue
+                matching_buy = max(candidates, key=lambda b: float(b.get("timestamp", 0)))
+                today_matched_buy_ids.add(matching_buy.get("id"))
+                sell_fee = float(sell.get("fee", {}).get("cost", 0.0))
+                buy_fee = float(matching_buy.get("fee", {}).get("cost", 0.0))
+                daily_pnl += float(sell.get("cost", 0.0)) - float(matching_buy.get("cost", 0.0))
+                today_fee += sell_fee + buy_fee
+            daily_pnl -= today_fee
 
             # Wins/losses: compare sell price vs last buy of same symbol
             wins = 0
