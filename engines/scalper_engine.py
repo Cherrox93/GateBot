@@ -1174,6 +1174,8 @@ class ScalperEngine:
         self._stats_cache_ts: float = 0.0
         self._stats_cache_ttl: float = 30.0
         self._session_start_time: float = time.time()
+        # Start equity = free USDT at startup (no positions yet)
+        self._start_equity: float = self._balance_cache
         self._day_start = datetime.now().date()
         self._debug_last_print: dict[str, float] = {}
         self._exec_attempts = 0
@@ -1333,11 +1335,21 @@ class ScalperEngine:
             total_trades = wins + losses
             win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
 
+            # Equity = free USDT + estimated value of open positions
+            positions_value = 0.0
+            for sym, pos_data in self._state.as_dict().items():
+                positions_value += float(pos_data.get("stake", 0.0))
+            equity = usdt_free + positions_value
+
+            # Session PnL = current equity - starting equity (always correct)
+            session_pnl = equity - self._start_equity
+
             stats = {
                 "bot": "scalper",
                 "usdt_free": round(usdt_free, 2),
                 "usdt_total": round(usdt_total, 2),
-                "session_pnl": round(session_pnl, 4),
+                "equity": round(equity, 2),
+                "session_pnl": round(session_pnl, 2),
                 "daily_pnl": round(daily_pnl, 4),
                 "total_fee_paid": round(total_fee, 4),
                 "wins": wins,

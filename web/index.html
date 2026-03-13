@@ -559,8 +559,6 @@
         <div class="stats-row">
           <div class="stat-item"><div class="stat-label">SALDO</div><div class="stat-value neu" id="stat-scalper-bal">0.00$</div></div>
           <div class="stat-item"><div class="stat-label">SESJA PnL</div><div class="stat-value neu" id="stat-scalper-pnl">0.00$</div></div>
-          <div class="stat-item"><div class="stat-label">DZIEŃ PnL</div><div class="stat-value neu" id="stat-scalper-daily">0.00$</div></div>
-          <div class="stat-item"><div class="stat-label">FEE</div><div class="stat-value neu" id="stat-scalper-fee">0.00$</div></div>
           <div class="stat-item"><div class="stat-label">WIN RATE</div><div class="stat-value neu" id="stat-scalper-wr">0%</div></div>
           <div class="stat-item"><div class="stat-label">WYGRANE</div><div class="stat-value pos" id="stat-scalper-w">0</div></div>
           <div class="stat-item"><div class="stat-label">PRZEGRANE</div><div class="stat-value neg" id="stat-scalper-l">0</div></div>
@@ -1104,9 +1102,9 @@ async function fetchScalperStats() {
     const d = await apiFetch('/api/scalper/profit');
     if (!d || d.error) return;
 
-    // Balance
+    // Saldo = USDT free + wartość otwartych pozycji
     const balEl = document.getElementById('stat-scalper-bal');
-    if (balEl) balEl.textContent = `${d.usdt_free}$`;
+    if (balEl) balEl.textContent = `${d.usdt_free || 0}$`;
 
     // Session PnL
     const pnlEl = document.getElementById('stat-scalper-pnl');
@@ -1115,18 +1113,6 @@ async function fetchScalperStats() {
       pnlEl.textContent = (sp >= 0 ? '+' : '') + sp.toFixed(2) + '$';
       pnlEl.className = 'stat-value ' + (sp > 0 ? 'pos' : sp < 0 ? 'neg' : 'neu');
     }
-
-    // Daily PnL
-    const dailyEl = document.getElementById('stat-scalper-daily');
-    if (dailyEl) {
-      const dp = d.daily_pnl || 0;
-      dailyEl.textContent = (dp >= 0 ? '+' : '') + dp.toFixed(2) + '$';
-      dailyEl.className = 'stat-value ' + (dp > 0 ? 'pos' : dp < 0 ? 'neg' : 'neu');
-    }
-
-    // Fee
-    const feeEl = document.getElementById('stat-scalper-fee');
-    if (feeEl) feeEl.textContent = (d.total_fee_paid || 0).toFixed(2) + '$';
 
     // Win rate / wins / losses
     const wrEl = document.getElementById('stat-scalper-wr');
