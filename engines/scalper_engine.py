@@ -945,6 +945,10 @@ class ExecutionEngine:
 
             # h) RUNNER activation — Phase 2→3 transition
             if gross_pnl >= TARGET_PROFIT_PCT:
+                # Cancel any open order so it can't fill as TP_MAKER behind our back
+                if pos.tp_order_id:
+                    await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
+                    pos.tp_order_id = None
                 runner_active = True
                 runner_sl = pos.tp_price
                 runner_peak = current
@@ -992,8 +996,8 @@ class ExecutionEngine:
                 continue
 
             # j) BREAK-EVEN activation — Phase 1→2 transition
-            # Place a real limit sell order on exchange at be_sl_price
-            # so the exit is guaranteed near that level, not subject to poll latency.
+            # No limit order on exchange — exit managed by software monitor only.
+            # Placing a limit would get filled as TP_MAKER before runner can activate.
             if gross_pnl >= BE_TRIGGER:
                 be_active = True
                 be_sl_price = pos.entry_price * (1.0 + BE_BUFFER * pos.direction)
@@ -1003,20 +1007,6 @@ class ExecutionEngine:
                     f"current={current:.6f}",
                     flush=True,
                 )
-                # Cancel existing TP order — BE limit replaces it
-                if pos.tp_order_id:
-                    await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                    pos.tp_order_id = None
-                # Place limit sell at be_sl_price as the new exit order
-                be_side = "sell" if pos.direction == 1 else "buy"
-                _be_order = await self._limit_order(ccxt_sym, be_side, pos.qty, be_sl_price)
-                if _be_order:
-                    pos.tp_order_id = _be_order.get("id")
-                    print(
-                        f"[{pos.symbol}] 🛡️ BE limit order placed "
-                        f"price={be_sl_price:.6f} id={pos.tp_order_id}",
-                        flush=True,
-                    )
                 continue
 
             # k) Normal SL — Phase 1 (before BE activation)
