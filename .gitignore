@@ -2,3 +2,4 @@ vault.py
 .env
 __pycache__/
 *.pyc
+analytics_scalper.db

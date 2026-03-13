@@ -60,7 +60,7 @@ class ScalperConfig:
     daily_loss_limit_pct: float = 0.0
     min_signal_strength: float = 0.0
     symbol_cooldown_sec: float = 0.0
-    momentum_min_change: float = 0.0
+    momentum_min_change: float = 0.00012
     volume_spike_mult: float = 0.0
     atr_filter_min: float = 0.0
     pullback_min_retrace: float = 0.0

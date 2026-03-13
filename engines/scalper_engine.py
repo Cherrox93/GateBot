@@ -2059,7 +2059,7 @@ class ScalperEngine:
         # Relaxed ATR filter: allow moderate volatility regimes.
         atr_1m_pct = self._cache.get_atr_1m_pct(symbol)
         _dbg_throttle = time.time() - self._debug_last_print.get(symbol, 0) > 10.0
-        if atr_1m_pct <= float(self.cfg.atr_filter_min) * 0.4:
+        if atr_1m_pct < float(self.cfg.atr_filter_min) * 0.4:
             if _dbg_throttle:
                 self._debug_last_print[symbol] = time.time()
                 print(f"[DEBUG {symbol}] SKIP: atr_too_low atr={atr_1m_pct:.5f} "
@@ -2095,6 +2095,12 @@ class ScalperEngine:
             vol_last_5s = 0.0
             baseline_volume = 0.0
 
+        # Skip symbols with no trade flow data (stale WS or illiquid pair)
+        if baseline_volume == 0 and vol_last_5s == 0:
+            if _dbg_throttle:
+                print(f"[DEBUG {symbol}] SKIP: no_trade_flow (WS stale or illiquid)", flush=True)
+            return
+
         trend_required = trend_dir == 1
         if price_change_5s > float(self.cfg.momentum_min_change) * 1.5:
             trend_required = True  # ignore trend filter on strong impulse
@@ -2107,7 +2113,7 @@ class ScalperEngine:
         if (
             price_change_5s > float(self.cfg.momentum_min_change)
             and baseline_volume > 0
-            and vol_last_5s > 1.2 * baseline_volume
+            and vol_last_5s > 1.5 * baseline_volume
             and trend_required
         ):
             entry = snapshot.last_price
