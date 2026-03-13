@@ -54,8 +54,6 @@ class ScalperConfig:
     stop_loss_pct: float = 0.0
     trailing_stop_pct: float = 0.0
     runner_trail_pct: float = 0.0010
-    be_trigger_pct: float = 0.0020
-    be_buffer_pct: float = 0.0021
     max_trades_day: int = 0
     daily_loss_limit_pct: float = 0.0
     min_signal_strength: float = 0.0

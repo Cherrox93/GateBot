@@ -545,8 +545,6 @@ class ExecutionEngine:
     """
 
     RUNNER_TRAIL_PCT: float = 0.0010
-    BE_TRIGGER_PCT:  float = 0.0020   # +0.20% gross → activate break-even
-    BE_BUFFER_PCT:   float = 0.0021   # BE SL at entry*(1+0.21%) — covers round-trip fee + buffer
 
     def __init__(
         self,
@@ -864,16 +862,10 @@ class ExecutionEngine:
         # MFE/MAE tracking (gross pnl extremes)
         _max_favorable = 0.0
         _max_adverse = 0.0
-        # Runner state (Phase 3)
+        # Runner state
         runner_active: bool = False
         runner_sl: float = 0.0
         runner_peak: float = 0.0
-        # Break-even state (Phase 2)
-        be_active: bool = False
-        be_sl_price: float = 0.0
-
-        BE_TRIGGER = self.BE_TRIGGER_PCT
-        BE_BUFFER  = self.BE_BUFFER_PCT
 
         while True:
             # a) sleep
@@ -960,56 +952,7 @@ class ExecutionEngine:
                 )
                 continue
 
-            # i) BREAK-EVEN block — Phase 2 active
-            if be_active:
-                if current * pos.direction <= be_sl_price * pos.direction:
-                    if pos.tp_order_id:
-                        await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                    try:
-                        _exit_order = await self._market_sell(pos, ccxt_sym)
-                        exit_price = _exit_order["price"]
-                        exit_fee_cost = _exit_order["fee_cost"]
-                        exit_fee_currency = _exit_order["fee_currency"]
-                        exit_reason = "BE"
-                        break
-                    except RuntimeError as _sell_err:
-                        print(f"[{pos.symbol}] SELL_FAILED — retrying monitor loop: {_sell_err}",
-                              flush=True)
-                        await asyncio.sleep(1.0)
-                        continue
-                # BE active but price above BE SL — check backup SL for flash crash
-                if gross_pnl <= -pos.sl_pct:
-                    if pos.tp_order_id:
-                        await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                    try:
-                        _exit_order = await self._market_sell(pos, ccxt_sym)
-                        exit_price = _exit_order["price"]
-                        exit_fee_cost = _exit_order["fee_cost"]
-                        exit_fee_currency = _exit_order["fee_currency"]
-                        exit_reason = "SL"
-                        break
-                    except RuntimeError as _sell_err:
-                        print(f"[{pos.symbol}] SELL_FAILED — retrying monitor loop: {_sell_err}",
-                              flush=True)
-                        await asyncio.sleep(1.0)
-                        continue
-                continue
-
-            # j) BREAK-EVEN activation — Phase 1→2 transition
-            # No limit order on exchange — exit managed by software monitor only.
-            # Placing a limit would get filled as TP_MAKER before runner can activate.
-            if gross_pnl >= BE_TRIGGER:
-                be_active = True
-                be_sl_price = pos.entry_price * (1.0 + BE_BUFFER * pos.direction)
-                print(
-                    f"[{pos.symbol}] 🛡️ BREAK-EVEN aktywny "
-                    f"be_sl={be_sl_price:.6f} "
-                    f"current={current:.6f}",
-                    flush=True,
-                )
-                continue
-
-            # k) Normal SL — Phase 1 (before BE activation)
+            # i) SL check
             if gross_pnl <= -pos.sl_pct:
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
@@ -1424,8 +1367,6 @@ class ScalperEngine:
         MAX_TRADES_DAY = int(self.cfg.max_trades_day)
         # Sync Runner/BE to executor
         self._executor.RUNNER_TRAIL_PCT = float(self.cfg.runner_trail_pct)
-        self._executor.BE_TRIGGER_PCT   = float(self.cfg.be_trigger_pct)
-        self._executor.BE_BUFFER_PCT    = float(self.cfg.be_buffer_pct)
         # Sync instance vars set from cfg in __init__
         self.symbol_cooldown_sec = float(self.cfg.symbol_cooldown_sec)
         self.max_position_size_usdt = float(self.cfg.max_position_size_usdt)
@@ -2517,8 +2458,6 @@ class ScalperEngine:
             icon = "🚀"
         elif result.exit_reason in ("TP", "TP_MAKER"):
             icon = "✅"
-        elif result.exit_reason == "BE":
-            icon = "🛡️"
         elif result.exit_reason == "SL":
             icon = "🔴"
         elif result.exit_reason == "TRAIL":

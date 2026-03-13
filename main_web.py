@@ -179,7 +179,6 @@ SETTINGS_DEFAULTS = {
         "stake_usd": 25.0, "max_slots": 2,
         "target_profit_pct": 0.0035, "stop_loss_pct": 0.0020, "trailing_stop_pct": 0.0015,
         "maker_fee": 0.001, "taker_fee": 0.001, "runner_trail_pct": 0.0010,
-        "be_trigger_pct": 0.0020, "be_buffer_pct": 0.0021,
         "reinvest_enabled": False, "reinvest_max_stake": 0.10,
         "stake_max_cap_usdt": 100.0, "base_stake_usdt": 50.0,
         "max_trades_day": 400, "daily_loss_limit_pct": 0.05,
@@ -412,7 +411,7 @@ def apply_settings_to_engines(settings: dict):
         # Risk
         _float_keys = [
             "target_profit_pct", "stop_loss_pct", "trailing_stop_pct", "maker_fee",
-            "taker_fee", "runner_trail_pct", "be_trigger_pct", "be_buffer_pct",
+            "taker_fee", "runner_trail_pct",
             "daily_loss_limit_pct", "min_signal_strength",
             "symbol_cooldown_sec", "momentum_min_change", "volume_spike_mult",
             "atr_filter_min", "pullback_min_retrace", "pullback_max_retrace",
@@ -588,7 +587,7 @@ def init_engines():
     scalper_cfg.max_open_positions   = scalper_cfg.slot_count
     _float_cfg_keys = [
         "target_profit_pct", "stop_loss_pct", "trailing_stop_pct", "maker_fee",
-        "taker_fee", "runner_trail_pct", "be_trigger_pct", "be_buffer_pct",
+        "taker_fee", "runner_trail_pct",
         "daily_loss_limit_pct", "max_position_time_sec", "min_signal_strength",
         "symbol_cooldown_sec", "momentum_min_change", "volume_spike_mult",
         "atr_filter_min", "pullback_min_retrace", "pullback_max_retrace",

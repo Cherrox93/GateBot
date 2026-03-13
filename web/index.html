@@ -698,14 +698,6 @@
             <input type="number" id="cfg-scalper-runner" step="0.01" min="0.01" max="5">
           </div>
           <div class="settings-field">
-            <label>BREAK-EVEN TRIGGER %</label>
-            <input type="number" id="cfg-scalper-be-trigger" step="0.01" min="0.01" max="5">
-          </div>
-          <div class="settings-field">
-            <label>BREAK-EVEN BUFFER %</label>
-            <input type="number" id="cfg-scalper-be-buffer" step="0.01" min="0.01" max="5">
-          </div>
-          <div class="settings-field">
             <label>DZIENNY LIMIT STRAT %</label>
             <input type="number" id="cfg-scalper-daily-loss" step="0.1" min="0.1" max="50">
           </div>
@@ -1467,8 +1459,6 @@ const SCALPER_FIELDS = [
   {id:'cfg-scalper-tp',           key:'target_profit_pct',       pct:true},
   {id:'cfg-scalper-sl',           key:'stop_loss_pct',           pct:true},
   {id:'cfg-scalper-runner',       key:'runner_trail_pct',        pct:true},
-  {id:'cfg-scalper-be-trigger',   key:'be_trigger_pct',          pct:true},
-  {id:'cfg-scalper-be-buffer',    key:'be_buffer_pct',           pct:true},
   {id:'cfg-scalper-daily-loss',   key:'daily_loss_limit_pct',    pct:true},
   {id:'cfg-scalper-momentum',     key:'momentum_min_change',     pct:true},
   {id:'cfg-scalper-atr',          key:'atr_filter_min',          pct:true},
