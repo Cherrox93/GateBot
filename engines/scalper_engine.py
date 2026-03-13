@@ -1920,17 +1920,26 @@ class ScalperEngine:
             return
 
         for symbol in self._symbols:
-            base_currency = symbol.split("_")[0]   # e.g. BTC from BTC_USDT
-            held = float(balances.get(base_currency, {}).get("total", 0.0))
+            base_currency = symbol.split("_")[0]
+            held = float(balances.get(base_currency, {}).get("free", 0.0))
             if held <= 0:
                 continue
 
-            # Find matching open TP order for this symbol
             ccxt_sym = symbol.replace("_", "/")
             sym_orders = [o for o in open_orders if o.get("symbol") == ccxt_sym]
-            tp_order_id = sym_orders[0]["id"] if sym_orders else None
 
-            # Estimate entry price from current ticker (best we can do without DB)
+            # KEY GUARD: only recover if there is an open order on exchange.
+            # A position without an open order was either manually closed,
+            # or is dust — do not reconstruct it.
+            if not sym_orders:
+                self.log(
+                    f"[RECOVERY] {symbol}: held={held:.6f} {base_currency} "
+                    f"but no open orders → skipping (manually closed or dust)"
+                )
+                continue
+
+            tp_order_id = sym_orders[0]["id"]
+
             try:
                 ticker = await loop.run_in_executor(
                     None, lambda: self.exchange_client.fetch_ticker(ccxt_sym)
@@ -1943,18 +1952,16 @@ class ScalperEngine:
                 continue
 
             stake = held * current_price
-            min_stake_usdt = 1.0  # ignore dust positions below $1
-            if stake < min_stake_usdt:
+            if stake < 2.0:
+                self.log(f"[RECOVERY] {symbol}: stake={stake:.2f}$ < 2$ — dust, skipping")
                 continue
 
-            # Reconstruct position with conservative SL (dynamic ATR-based)
-            # We don't know original entry price — use current as approximation
             atr = self._cache.get_atr_1m_pct(symbol)
             recovery_sl_pct = max(atr * 1.3, float(self.cfg.stop_loss_pct))
 
             pos = OpenPosition(
                 symbol=symbol,
-                direction=1,  # spot — always long
+                direction=1,
                 entry_price=current_price,
                 tp_price=current_price * (1 + TARGET_PROFIT_PCT),
                 sl_price=current_price * (1 - recovery_sl_pct),
@@ -1973,15 +1980,13 @@ class ScalperEngine:
             msg = (
                 f"♻️ RECOVERY: {symbol} | held={held:.6f} {base_currency}"
                 f" | ~price={current_price:.4f} | SL={pos.sl_price:.4f}"
-                f" | TP_order={'yes' if tp_order_id else 'none'}"
+                f" | TP_order={tp_order_id}"
             )
             self.log(msg)
             await self._tg(msg)
 
-            # Resume monitoring in background task
-            ccxt_sym_monitor = symbol.replace("_", "/")
             asyncio.create_task(
-                self._executor._monitor(pos, ccxt_sym_monitor, fill_latency_sec=0.0)
+                self._executor._monitor(pos, ccxt_sym, fill_latency_sec=0.0)
             )
 
         if recovered == 0:
