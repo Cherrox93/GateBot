@@ -625,13 +625,29 @@ class ExecutionEngine:
             available = float(bal.get(base_currency, {}).get("free", 0.0))
             if available <= 0:
                 raise ValueError(f"zero_available_balance for {base_currency}")
-            if available < sell_qty:
+
+            # Zawsze sprzedaj CAŁE dostępne saldo base currency
+            # — nie tylko pos.qty. Eliminuje dust po każdym trade.
+            sell_qty = available
+
+            # Gate.io wymaga minimalnej wartości zlecenia ~1 USDT
+            # Jeśli available jest dust-only (< 0.50$) — pomiń sprzedaż
+            top = self._cache.get_top_of_book(pos.symbol) if self._cache else None
+            if top:
+                current_price = (top[0] + top[1]) / 2.0
+                notional = sell_qty * current_price
+                if notional < 1.0:
+                    raise ValueError(
+                        f"dust_below_min_order: {sell_qty:.8f} {base_currency}"
+                        f" ≈ {notional:.4f} USDT — pomijam sprzedaż"
+                    )
+
+            if sell_qty < pos.qty * 0.95:
                 print(
-                    f"[{pos.symbol}] qty adjusted {sell_qty:.6f}→{available:.6f} "
-                    f"(fee deducted from base)",
+                    f"[{pos.symbol}] WARN: available={sell_qty:.8f} << "
+                    f"pos.qty={pos.qty:.8f} — duży dust, sprawdź fees",
                     flush=True,
                 )
-                sell_qty = available
         except Exception as e:
             print(f"[{pos.symbol}] balance fetch failed, using pos.qty: {e}", flush=True)
 
@@ -1121,6 +1137,8 @@ class ScalperEngine:
         self._start_equity: float = self._balance_cache
         self._day_start = datetime.now().date()
         self._debug_last_print: dict[str, float] = {}
+        self._consecutive_losses: int = 0
+        self._circuit_breaker_until: float = 0.0
         self._exec_attempts = 0
         self._exec_fills = 0
         self._exec_missed = 0
@@ -1495,18 +1513,24 @@ class ScalperEngine:
         return self._cache.get_atr_1m_pct(symbol) > float(self.cfg.atr_filter_min)
 
     def _trend_direction(self, symbol: str) -> int:
-        trend_window = float(self.cfg.trend_window_sec)
-        ema_period = int(self.cfg.trend_ema_period)
-        ticks = self._cache.get_price_ticks(symbol, trend_window)
-        if len(ticks) < ema_period:
+        """Dual EMA trend filter: EMA20 + EMA50 over 5-min window.
+
+        Returns 1 (bullish stack: price > EMA20 > EMA50),
+               -1 (bearish: price < EMA20 < EMA50),
+                0 (mixed / insufficient data).
+        """
+        window = 300  # 5 min
+        ema20 = self._cache.get_ema(symbol, period=20, window_sec=window)
+        ema50 = self._cache.get_ema(symbol, period=50, window_sec=window)
+        if ema20 is None or ema50 is None:
             return 0
-        last = ticks[-1][1]
-        ema = self._cache.get_ema(symbol, period=ema_period, window_sec=trend_window)
-        if ema is None:
+        ticks = self._cache.get_price_ticks(symbol, window)
+        if len(ticks) < 50:
             return 0
-        if last > ema:
+        price = ticks[-1][1]
+        if price > ema20 > ema50:
             return 1
-        if last < ema:
+        if price < ema20 < ema50:
             return -1
         return 0
 
@@ -2111,6 +2135,8 @@ class ScalperEngine:
             return
         if self._cache.is_stale(symbol, max_age_ms=float(self.cfg.stale_max_age_ms)):
             return
+        if time.time() < self._circuit_breaker_until:
+            return
 
         snapshot = self._cache.get_snapshot(symbol)
         if snapshot is None:
@@ -2161,21 +2187,39 @@ class ScalperEngine:
             return
 
         trend_required = trend_dir == 1
-        if price_change_5s > float(self.cfg.momentum_min_change) * 1.5:
-            trend_required = True  # ignore trend filter on strong impulse
+        # trend_required is no longer overridden — dual EMA filter always applies
 
         impulse = self._detect_impulse(symbol)
         if impulse is not None:
             self._impulses[symbol] = impulse
 
-        # 1) Immediate momentum breakout (no pullback wait).
+        # 1) Momentum breakout with micro-pullback entry.
         if (
             price_change_5s > float(self.cfg.momentum_min_change)
             and baseline_volume > 0
             and vol_last_5s > 1.5 * baseline_volume
             and trend_required
         ):
-            entry = snapshot.last_price
+            impulse_detected_price = snapshot.last_price
+            _entry_price = impulse_detected_price
+            _pullback_target = impulse_detected_price * 0.9990  # 0.10% niżej
+            _waited = 0
+            while _waited < 4:  # max 4 × 0.5s = 2s
+                await asyncio.sleep(0.5)
+                _waited += 1
+                _current = self._cache.get_top_of_book(symbol)
+                if _current is None:
+                    break
+                _bid, _ask, _, _ = _current
+                _mid = (_bid + _ask) / 2.0
+                if _mid <= _pullback_target:
+                    _entry_price = _mid
+                    break
+                if _mid > impulse_detected_price * 1.003:
+                    _entry_price = _mid
+                    break
+
+            entry = _entry_price
             signals.append(
                 Signal(
                     symbol=symbol,
@@ -2188,7 +2232,7 @@ class ScalperEngine:
                     sl_price=entry * (1 - STOP_LOSS_PCT),
                     tp_pct=TARGET_PROFIT_PCT,
                     sl_pct=STOP_LOSS_PCT,
-                    reason=f"breakout5s={price_change_5s:.4f} vol_spike",
+                    reason=f"breakout5s={price_change_5s:.4f} vol_spike pullback_entry",
                 )
             )
 
@@ -2431,6 +2475,22 @@ class ScalperEngine:
 
         self._invalidate_balance_cache()  # force fresh balance on next check
         self._stats_cache_ts = 0.0        # invalidate stats cache — force refresh
+
+        # ── Circuit breaker: 3 consecutive SL losses → 20 min pause ──
+        if net_pnl < 0:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= 3:
+                pause_min = 20
+                self._circuit_breaker_until = time.time() + pause_min * 60
+                cb_msg = (
+                    f"🛑 CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses — "
+                    f"trading paused for {pause_min} min"
+                )
+                self.log(cb_msg)
+                self.gui_log(cb_msg)
+                await self._tg(cb_msg)
+        else:
+            self._consecutive_losses = 0
 
         # ── Analytics exit (with MFE/MAE) — uses local calculation, not exchange ──
         _local_pnl = result.pnl_usd - result.fee_paid

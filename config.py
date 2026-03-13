@@ -96,9 +96,17 @@ class ScalperConfig:
         "BTC/USDT",
         "ETH/USDT",
         "SOL/USDT",
-        "BNB/USDT",
         "XRP/USDT",
+        "BNB/USDT",
         "DOGE/USDT",
+        "ADA/USDT",
+        "AVAX/USDT",
+        "SUI/USDT",
+        "LINK/USDT",
+        "LTC/USDT",
+        "ARB/USDT",
+        "DOT/USDT",
+        "NEAR/USDT",
     )
 
 

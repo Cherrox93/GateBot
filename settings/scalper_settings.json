@@ -6,7 +6,7 @@
   "trailing_stop_pct": 0.0,
   "maker_fee": 0.001,
   "taker_fee": 0.001,
-  "runner_trail_pct": 0.001,
+  "runner_trail_pct": 0.002,
   "reinvest_enabled": true,
   "reinvest_max_stake": 1.0,
   "stake_max_cap_usdt": 100.0,
