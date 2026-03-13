@@ -614,24 +614,32 @@ class ExecutionEngine:
 
     async def _market_sell(self, pos: OpenPosition, ccxt_sym: str) -> dict:
         side = "sell" if pos.direction == 1 else "buy"
-        try:
-            o = await self._call(self.exchange.create_order, ccxt_sym, "market", side, pos.qty)
-            # Fetch the completed order for real fill data
-            order_id = o.get("id")
-            if order_id:
-                await asyncio.sleep(0.5)  # brief wait for exchange to settle
-                o = await self._call(self.exchange.fetch_order, order_id, ccxt_sym) or o
-            return {
-                "price": float(o.get("average") or o.get("price") or pos.entry_price),
-                "fee_cost": float((o.get("fee") or {}).get("cost") or 0.0),
-                "fee_currency": (o.get("fee") or {}).get("currency") or "USDT",
-            }
-        except Exception:
-            return {
-                "price": pos.entry_price,
-                "fee_cost": 0.0,
-                "fee_currency": "USDT",
-            }
+        last_exc: Exception = Exception("no_attempts")
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    await asyncio.sleep(0.5 * attempt)
+                o = await self._call(self.exchange.create_order, ccxt_sym, "market", side, pos.qty)
+                order_id = o.get("id")
+                if order_id:
+                    await asyncio.sleep(0.5)
+                    o = await self._call(self.exchange.fetch_order, order_id, ccxt_sym) or o
+                filled = float(o.get("average") or o.get("price") or 0.0)
+                if filled <= 0:
+                    raise ValueError(f"zero_fill attempt={attempt}")
+                return {
+                    "price": filled,
+                    "fee_cost": float((o.get("fee") or {}).get("cost") or 0.0),
+                    "fee_currency": (o.get("fee") or {}).get("currency") or "USDT",
+                }
+            except Exception as e:
+                last_exc = e
+                print(f"[ORDER] _market_sell FAILED attempt={attempt+1}/3 "
+                      f"{ccxt_sym} qty={pos.qty}: {e}", flush=True)
+        # All retries exhausted — raise so caller handles position correctly
+        raise RuntimeError(
+            f"_market_sell: 3 retries exhausted for {ccxt_sym} qty={pos.qty}: {last_exc}"
+        )
 
     def _get_cached_price(self, symbol: str, fallback: float) -> float:
         """Get latest price from WebSocket cache — zero latency vs REST."""
@@ -882,12 +890,18 @@ class ExecutionEngine:
                 if current <= effective_sl:
                     if pos.tp_order_id:
                         await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                    _exit_order = await self._market_sell(pos, ccxt_sym)
-                    exit_price = _exit_order["price"]
-                    exit_fee_cost = _exit_order["fee_cost"]
-                    exit_fee_currency = _exit_order["fee_currency"]
-                    exit_reason = "RUNNER"
-                    break
+                    try:
+                        _exit_order = await self._market_sell(pos, ccxt_sym)
+                        exit_price = _exit_order["price"]
+                        exit_fee_cost = _exit_order["fee_cost"]
+                        exit_fee_currency = _exit_order["fee_currency"]
+                        exit_reason = "RUNNER"
+                        break
+                    except RuntimeError as _sell_err:
+                        print(f"[{pos.symbol}] SELL_FAILED — retrying monitor loop: {_sell_err}",
+                              flush=True)
+                        await asyncio.sleep(1.0)
+                        continue
                 continue  # runner active — skip other checks
 
             # g) NEAR TP logging
@@ -917,22 +931,34 @@ class ExecutionEngine:
                 if current * pos.direction <= be_sl_price * pos.direction:
                     if pos.tp_order_id:
                         await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                    _exit_order = await self._market_sell(pos, ccxt_sym)
-                    exit_price = _exit_order["price"]
-                    exit_fee_cost = _exit_order["fee_cost"]
-                    exit_fee_currency = _exit_order["fee_currency"]
-                    exit_reason = "BE"
-                    break
+                    try:
+                        _exit_order = await self._market_sell(pos, ccxt_sym)
+                        exit_price = _exit_order["price"]
+                        exit_fee_cost = _exit_order["fee_cost"]
+                        exit_fee_currency = _exit_order["fee_currency"]
+                        exit_reason = "BE"
+                        break
+                    except RuntimeError as _sell_err:
+                        print(f"[{pos.symbol}] SELL_FAILED — retrying monitor loop: {_sell_err}",
+                              flush=True)
+                        await asyncio.sleep(1.0)
+                        continue
                 # BE active but price above BE SL — check backup SL for flash crash
                 if gross_pnl <= -pos.sl_pct:
                     if pos.tp_order_id:
                         await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                    _exit_order = await self._market_sell(pos, ccxt_sym)
-                    exit_price = _exit_order["price"]
-                    exit_fee_cost = _exit_order["fee_cost"]
-                    exit_fee_currency = _exit_order["fee_currency"]
-                    exit_reason = "SL"
-                    break
+                    try:
+                        _exit_order = await self._market_sell(pos, ccxt_sym)
+                        exit_price = _exit_order["price"]
+                        exit_fee_cost = _exit_order["fee_cost"]
+                        exit_fee_currency = _exit_order["fee_currency"]
+                        exit_reason = "SL"
+                        break
+                    except RuntimeError as _sell_err:
+                        print(f"[{pos.symbol}] SELL_FAILED — retrying monitor loop: {_sell_err}",
+                              flush=True)
+                        await asyncio.sleep(1.0)
+                        continue
                 continue
 
             # j) BREAK-EVEN activation — Phase 1→2 transition
@@ -951,12 +977,18 @@ class ExecutionEngine:
             if gross_pnl <= -pos.sl_pct:
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
-                _exit_order = await self._market_sell(pos, ccxt_sym)
-                exit_price = _exit_order["price"]
-                exit_fee_cost = _exit_order["fee_cost"]
-                exit_fee_currency = _exit_order["fee_currency"]
-                exit_reason = "SL"
-                break
+                try:
+                    _exit_order = await self._market_sell(pos, ccxt_sym)
+                    exit_price = _exit_order["price"]
+                    exit_fee_cost = _exit_order["fee_cost"]
+                    exit_fee_currency = _exit_order["fee_currency"]
+                    exit_reason = "SL"
+                    break
+                except RuntimeError as _sell_err:
+                    print(f"[{pos.symbol}] SELL_FAILED — retrying monitor loop: {_sell_err}",
+                          flush=True)
+                    await asyncio.sleep(1.0)
+                    continue
 
         return self._build_result(pos, exit_price, exit_reason, fill_latency_sec,
                                   exit_fee_cost=exit_fee_cost, exit_fee_currency=exit_fee_currency,
