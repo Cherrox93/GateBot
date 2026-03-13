@@ -614,16 +614,43 @@ class ExecutionEngine:
 
     async def _market_sell(self, pos: OpenPosition, ccxt_sym: str) -> dict:
         side = "sell" if pos.direction == 1 else "buy"
+
+        # Fetch actual available balance of base currency to avoid BALANCE_NOT_ENOUGH.
+        # Gate.io deducts fees from base currency on buy, so held qty < pos.qty.
+        base_currency = ccxt_sym.split("/")[0]
+        sell_qty = pos.qty
+        try:
+            loop = asyncio.get_running_loop()
+            bal = await loop.run_in_executor(
+                None, lambda: self.exchange.fetch_balance()
+            )
+            available = float(bal.get(base_currency, {}).get("free", 0.0))
+            if available <= 0:
+                raise ValueError(f"zero_available_balance for {base_currency}")
+            if available < sell_qty:
+                print(
+                    f"[{pos.symbol}] qty adjusted {sell_qty:.6f}→{available:.6f} "
+                    f"(fee deducted from base)",
+                    flush=True,
+                )
+                sell_qty = available
+        except Exception as e:
+            print(f"[{pos.symbol}] balance fetch failed, using pos.qty: {e}", flush=True)
+
         last_exc: Exception = Exception("no_attempts")
         for attempt in range(3):
             try:
                 if attempt > 0:
                     await asyncio.sleep(0.5 * attempt)
-                o = await self._call(self.exchange.create_order, ccxt_sym, "market", side, pos.qty)
+                o = await self._call(
+                    self.exchange.create_order, ccxt_sym, "market", side, sell_qty
+                )
                 order_id = o.get("id")
                 if order_id:
                     await asyncio.sleep(0.5)
-                    o = await self._call(self.exchange.fetch_order, order_id, ccxt_sym) or o
+                    o = await self._call(
+                        self.exchange.fetch_order, order_id, ccxt_sym
+                    ) or o
                 filled = float(o.get("average") or o.get("price") or 0.0)
                 if filled <= 0:
                     raise ValueError(f"zero_fill attempt={attempt}")
@@ -634,11 +661,14 @@ class ExecutionEngine:
                 }
             except Exception as e:
                 last_exc = e
-                print(f"[ORDER] _market_sell FAILED attempt={attempt+1}/3 "
-                      f"{ccxt_sym} qty={pos.qty}: {e}", flush=True)
-        # All retries exhausted — raise so caller handles position correctly
+                print(
+                    f"[ORDER] _market_sell FAILED attempt={attempt+1}/3 "
+                    f"{ccxt_sym} qty={sell_qty:.6f}: {e}",
+                    flush=True,
+                )
         raise RuntimeError(
-            f"_market_sell: 3 retries exhausted for {ccxt_sym} qty={pos.qty}: {last_exc}"
+            f"_market_sell: 3 retries exhausted for {ccxt_sym} "
+            f"qty={sell_qty:.6f}: {last_exc}"
         )
 
     def _get_cached_price(self, symbol: str, fallback: float) -> float:
