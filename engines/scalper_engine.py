@@ -2263,12 +2263,15 @@ class ScalperEngine:
                 self._state.remove(signal.symbol)
                 continue
 
-            # 5. R:R guard
+            # 5. R:R guard — uses expected runner exit, not initial TP trigger
+            # signal.tp_pct is only the runner activation threshold (e.g. 0.5%)
+            # The real exit is runner trailing, conservatively estimated at 2× TP
             _atr_now = self._cache.get_atr_1m_pct(signal.symbol)
             _eff_sl = max(_atr_now * 1.3, STOP_LOSS_PCT)
-            _net_reward = signal.tp_pct - (MAKER_FEE + TAKER_FEE)
-            _net_risk   = _eff_sl      + (MAKER_FEE + TAKER_FEE)
-            if _net_risk <= 0 or (_net_reward / _net_risk) < 1.0:
+            _expected_exit_pct = signal.tp_pct * 2.0   # runner adds at minimum 1× TP beyond trigger
+            _net_reward = _expected_exit_pct - (MAKER_FEE + TAKER_FEE)
+            _net_risk   = _eff_sl            + (MAKER_FEE + TAKER_FEE)
+            if _net_risk <= 0 or (_net_reward / _net_risk) < 0.8:
                 self._state.remove(signal.symbol)
                 self.log(
                     f"[{signal.symbol}] RR_SKIP ratio="
