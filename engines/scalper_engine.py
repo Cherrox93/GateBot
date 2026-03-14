@@ -1164,8 +1164,8 @@ class ScalperEngine:
         self._stats_cache_ts: float = 0.0
         self._stats_cache_ttl: float = 30.0
         self._session_start_time: float = time.time()
-        # Start equity = free USDT at startup (no positions yet)
-        self._start_equity: float = self._balance_cache
+        # Start equity — ustawiane w _run() PO recovery
+        self._start_equity: float = 0.0
         self._day_start = datetime.now().date()
         self._debug_last_print: dict[str, float] = {}
         self._accepting_signals: bool = True
@@ -1961,8 +1961,37 @@ class ScalperEngine:
         """Async start — creates WS and processing tasks."""
         if self.running:
             return
+
+        # Reset pełnego stanu przed startem
         self.running = True
+        self._accepting_signals = True
         self._last_ws_ok = time.time()
+
+        # Reset tasków — upewnij się że stare są anulowane
+        for task in [self.main_task, self._ws_task,
+                     self._poll_task, self._pair_task]:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except Exception:
+                    pass
+
+        self.main_task = None
+        self._ws_task = None
+        self._poll_task = None
+        self._pair_task = None
+        self._process_tasks.clear()
+
+        # Reset circuit breaker i liczników sesji
+        self._consecutive_losses = 0
+        self._circuit_breaker_until = 0.0
+        self._session_wins = 0
+        self._session_losses = 0
+        self._stats_cache = {}
+        self._stats_cache_ts = 0.0
+
+        # Uruchom nową sesję
         loop = asyncio.get_running_loop()
         self.main_task = loop.create_task(self._run())
         if self.tg:
@@ -2128,14 +2157,19 @@ class ScalperEngine:
 
         await self._recover_open_positions()
 
-        # Ustaw start equity po recovery — świeży balance + pozycje
-        _bal = await self._get_available_balance()
+        # Odśwież balance po recovery
+        _fresh_bal = await self._get_available_balance()
+
+        # Dodaj wartość odzyskanych pozycji
         _pos_val = sum(
             float(p.get("stake", 0.0))
             for p in self._state.as_dict().values()
         )
-        self._start_equity = _bal + _pos_val
-        self.log(f"[STATS] Start equity: {self._start_equity:.2f}$")
+        self._start_equity = round(_fresh_bal + _pos_val, 2)
+        self.log(
+            f"[STATS] Start equity: {self._start_equity:.2f}$ "
+            f"(USDT: {_fresh_bal:.2f}$ + pozycje: {_pos_val:.2f}$)"
+        )
 
         if self._warmup_ready():
             self._refresh_scalper_pairs()
@@ -2531,13 +2565,26 @@ class ScalperEngine:
             # 3. Balance fetch (await — now safe, slot already claimed)
             balance_now = await self._get_available_balance()
 
+            # Odejmij wartość otwartych pozycji od dostępnego balansu
+            # żeby nie próbować kupić za środki które są zajęte
+            engaged = sum(
+                float(p.get("stake", 0.0))
+                for p in self._state.as_dict().values()
+            )
+            truly_free = max(balance_now - engaged, 0.0)
+
             stake = self._calc_effective_stake()
-            if balance_now < stake:
-                stake = balance_now
+            if truly_free < stake:
+                stake = truly_free
+
             min_stake = float(self.cfg.base_stake_usdt) * 0.95
             if stake < min_stake:
                 self._state.remove(signal.symbol)
-                if _dbg_throttle: print(f"[DEBUG {symbol}] SKIP: stake {stake:.2f}$ < min {min_stake:.2f}$ bal={balance_now:.2f}", flush=True)
+                self.log(
+                    f"[{signal.symbol}] SKIP: truly_free={truly_free:.2f}$ "
+                    f"< min_stake={min_stake:.2f}$ "
+                    f"(balance={balance_now:.2f}$ engaged={engaged:.2f}$)"
+                )
                 continue
 
             # 4. Remaining filter checks (balance already known)
@@ -2572,7 +2619,6 @@ class ScalperEngine:
             self._pending_orders.add(signal.symbol)
             self._trade_rate_window.append(now)
             ml_features = self._collect_ml_features(signal.symbol, signal, features, snapshot)
-            self._log_signal(signal, stake)
             # Zapisz pozycję na dysk przed wykonaniem — recovery na wypadek restartu
             self._save_position({
                 "symbol": signal.symbol,
@@ -2658,6 +2704,19 @@ class ScalperEngine:
             self._pending_orders.discard(signal.symbol)
             self._last_trade_ts[signal.symbol] = time.time()
             return
+
+        # Loguj BUY z RZECZYWISTYMI wartościami po wypełnieniu
+        _real_entry = result.entry_price
+        _real_stake = result.stake
+        ccxt_sym = signal.symbol.replace("_", "/")
+        buy_msg = (
+            f"💰 BUY {ccxt_sym} | Entry Price: {_real_entry} | "
+            f"Stawka: {_real_stake:.2f}$"
+        )
+        self.set_status(f"🚀 BUY {ccxt_sym}")
+        self.gui_log(buy_msg)
+        self.log(buy_msg)
+        await self._tg(buy_msg)
 
         self._state.trades_today += 1
 
