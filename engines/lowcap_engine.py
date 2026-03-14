@@ -336,13 +336,16 @@ class LowcapEngine:
         self.log_trade_to_db(symbol, "sell", sell_fill, qty, stake, pnl, reason)
 
         tid = self._trade_ids.pop(f"{symbol}:{id(pos)}", None)
-        if tid:
-            self.analytics.on_exit(
-                trade_id=tid,
-                exit_reason=reason,
-                pnl=pnl,
-                pnl_pct=(pnl / stake) if stake > 0 else 0,
-            )
+        self.analytics.on_exit(
+            trade_id=tid or f"lowcap_{symbol}_{int(time.time()*1000)}",
+            exit_reason=reason,
+            pnl=pnl,
+            pnl_pct=(pnl / stake) if stake > 0 else 0,
+            symbol=symbol,
+            entry_price=pos.get("buy_price", 0.0),
+            stake=stake,
+            hold_seconds=time.time() - pos.get("buy_time", time.time()),
+        )
 
         icon = "✅" if pnl >= 0 else "❌"
         msg = (

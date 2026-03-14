@@ -16,6 +16,7 @@ Użycie:
     analytics = get_analytics('grid_bot')  # osobna instancja
 """
 
+import os
 import sqlite3
 import json
 import time
@@ -734,10 +735,54 @@ class AnalyticsEngine:
         self.ml_pipeline = MLPipeline(bot)
         self._adjustment = self._empty_adj()
         self._pending: dict = {}
+        self._pending_dir = f"analytics/pending_{bot}"
         self._lock = threading.Lock()
         self._retrain_counter = 0
+        self._load_pending_from_disk()
         self._start_background()
-        logger.info(f"[Analytics:{bot}] Uruchomiony")
+        logger.info(f"[Analytics:{bot}] Uruchomiony (pending restored: {len(self._pending)})")
+
+    # ── PENDING PERSISTENCE ──
+
+    def _load_pending_from_disk(self):
+        """Odczytaj pending trades z dysku — przetrwają restart procesu."""
+        import glob as _glob
+        os.makedirs(self._pending_dir, exist_ok=True)
+        for filepath in _glob.glob(os.path.join(self._pending_dir, "*.json")):
+            try:
+                with open(filepath, "r") as f:
+                    data = json.load(f)
+                trade_id = data.pop("_trade_id", None)
+                if trade_id:
+                    # _entry_time nie przetrwa restartu — użyjemy entry_time z danych
+                    data["_entry_time"] = time.monotonic()
+                    self._pending[trade_id] = data
+            except Exception as e:
+                logger.warning(f"[Analytics:{self.bot}] Failed to load pending {filepath}: {e}")
+
+    def _save_pending_file(self, trade_id: str, data: dict):
+        """Zapisz pending trade na dysk."""
+        try:
+            os.makedirs(self._pending_dir, exist_ok=True)
+            safe_name = trade_id.replace("/", "_").replace(":", "_")
+            filepath = os.path.join(self._pending_dir, f"{safe_name}.json")
+            save_data = dict(data)
+            save_data["_trade_id"] = trade_id
+            save_data.pop("_entry_time", None)  # monotonic nie przetrwa restartu
+            with open(filepath, "w") as f:
+                json.dump(save_data, f)
+        except Exception as e:
+            logger.warning(f"[Analytics:{self.bot}] Failed to save pending {trade_id}: {e}")
+
+    def _remove_pending_file(self, trade_id: str):
+        """Usuń pending file po on_exit."""
+        try:
+            safe_name = trade_id.replace("/", "_").replace(":", "_")
+            filepath = os.path.join(self._pending_dir, f"{safe_name}.json")
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
 
     # ── ENTRY ──
 
@@ -783,6 +828,7 @@ class AnalyticsEngine:
             pending_data['btc_atr_pct'] = float(features.get('btc_atr_pct') or 0)
             pending_data['btc_vol_ratio'] = float(features.get('btc_vol_ratio') or 1.0)
             self._pending[trade_id] = pending_data
+            self._save_pending_file(trade_id, pending_data)
 
         return dict(
             trade_id=trade_id,
@@ -797,24 +843,58 @@ class AnalyticsEngine:
     # ── EXIT ──
 
     def on_exit(self, trade_id: str, exit_reason: str, pnl: float, pnl_pct: float,
-                mfe: float = 0.0, mae: float = 0.0):
+                mfe: float = 0.0, mae: float = 0.0,
+                symbol: str = "", entry_price: float = 0.0,
+                stake: float = 0.0, hold_seconds: float = 0.0):
         with self._lock:
             p = self._pending.pop(trade_id, None)
-        if not p:
+
+        if p:
+            # Normalna ścieżka — mamy dane z on_entry
+            hold = time.monotonic() - p.pop('_entry_time', time.monotonic())
+            self._remove_pending_file(trade_id)
+        elif symbol and entry_price > 0:
+            # Fallback — po restarcie _pending jest pusty
+            # Budujemy minimalny record z danych przekazanych przez silnik
+            now = datetime.now()
+            p = dict(
+                bot=self.bot, symbol=symbol,
+                timestamp=now.isoformat(),
+                hour=now.hour, day_of_week=now.weekday(),
+                session=self._session(now.hour),
+                entry_price=entry_price, stake=stake,
+                sl_pct=0.0, tp1_pct=0.0,
+                score=0, vol_ratio=0, body_ratio=0, atr_pct=0,
+                upper_wick_ratio=0, breakout_strength=1.0,
+                ema9_slope=0, ema21_slope=0, ema_spread=0,
+                btc_trend=0, btc_atr_pct=0, btc_vol_ratio=1.0,
+                ml_level=1, ml_confidence=0.5, ml_approved=1,
+            )
+            hold = hold_seconds
+            logger.info(f"[Analytics:{self.bot}] on_exit fallback for {symbol} (post-restart)")
+        else:
+            # Brak danych — nie możemy zapisać
+            logger.warning(
+                f"[Analytics:{self.bot}] on_exit: trade_id={trade_id} "
+                f"not in _pending and no fallback data — trade NOT recorded"
+            )
             return
-        hold = time.monotonic() - p.pop('_entry_time', time.monotonic())
-        # Build record from pending data
+
         record_data = {}
         for k in TradeRecord.__dataclass_fields__:
             if k in p:
                 record_data[k] = p[k]
-        record = TradeRecord(
-            **record_data,
-            exit_reason=exit_reason, pnl=pnl, pnl_pct=pnl_pct,
-            hold_seconds=hold, win=1 if pnl > 0 else 0,
-            mfe=mfe, mae=mae,
-        )
-        self.db.insert_trade(record)
+        try:
+            record = TradeRecord(
+                **record_data,
+                exit_reason=exit_reason, pnl=pnl, pnl_pct=pnl_pct,
+                hold_seconds=hold, win=1 if pnl > 0 else 0,
+                mfe=mfe, mae=mae,
+            )
+            self.db.insert_trade(record)
+        except Exception as e:
+            logger.error(f"[Analytics:{self.bot}] on_exit insert error: {e}")
+            return
         self._retrain_counter += 1
         if self._retrain_counter >= 25:
             self._retrain_counter = 0

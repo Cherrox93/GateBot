@@ -2896,15 +2896,19 @@ class ScalperEngine:
         # ── Analytics exit (with MFE/MAE) — uses local calculation, not exchange ──
         _local_pnl = result.pnl_usd - result.fee_paid
         _tid = self._trade_ids.pop(signal.symbol, None)
-        if _tid:
-            self.analytics.on_exit(
-                trade_id=_tid,
-                exit_reason=result.exit_reason,
-                pnl=_local_pnl,
-                pnl_pct=_local_pnl / stake if stake > 0 else 0,
-                mfe=getattr(result, 'mfe', 0.0),
-                mae=getattr(result, 'mae', 0.0),
-            )
+        self.analytics.on_exit(
+            trade_id=_tid or f"scalper_{signal.symbol}_{int(time.time()*1000)}",
+            exit_reason=result.exit_reason,
+            pnl=_local_pnl,
+            pnl_pct=_local_pnl / stake if stake > 0 else 0,
+            mfe=getattr(result, 'mfe', 0.0),
+            mae=getattr(result, 'mae', 0.0),
+            # Fallback data — używane gdy _pending jest pusty (po restarcie)
+            symbol=signal.symbol.replace("_", "/"),
+            entry_price=result.entry_price,
+            stake=stake,
+            hold_seconds=result.duration,
+        )
 
         # Log in project-standard format (make_log_callback parses "SELL" + "PnL:")
         # Warn if SL exit with ~zero PnL (may indicate failed sell)
