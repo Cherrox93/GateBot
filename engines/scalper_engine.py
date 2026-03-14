@@ -882,17 +882,16 @@ class ExecutionEngine:
         runner_active: bool = False
         runner_sl: float = 0.0
         runner_peak: float = 0.0
+        _balance_check_last: float = 0.0  # lokalna, nie atrybut klasy
 
         while True:
             # a) sleep
             await asyncio.sleep(MONITOR_POLL_SEC)
             now = time.time()
 
-            # Co 30s sprawdź czy pozycja nadal istnieje na giełdzie
-            if not hasattr(self, '_last_balance_check'):
-                self._last_balance_check = 0.0
-            if now - self._last_balance_check >= 30.0:
-                self._last_balance_check = now
+            # Co 60s sprawdź czy pozycja nadal istnieje na giełdzie
+            if now - _balance_check_last >= 60.0:
+                _balance_check_last = now
                 try:
                     base_currency = ccxt_sym.split("/")[0]
                     loop = asyncio.get_running_loop()
@@ -902,7 +901,6 @@ class ExecutionEngine:
                     available = float(
                         (bal.get(base_currency) or {}).get("free") or 0.0
                     )
-                    # Jeśli saldo < 5% oryginalnej qty — pozycja zamknięta manualnie
                     if available < pos.qty * 0.05:
                         print(
                             f"[{pos.symbol}] MANUAL_CLOSE wykryty — "
@@ -916,7 +914,10 @@ class ExecutionEngine:
                         )
                         break
                 except Exception as e:
-                    print(f"[{pos.symbol}] balance check error: {e}", flush=True)
+                    print(
+                        f"[{pos.symbol}] balance check error (non-fatal): {e}",
+                        flush=True,
+                    )
 
             # b) current price — WebSocket cache first, REST fallback
             current = self._get_cached_price(pos.symbol, 0.0)
