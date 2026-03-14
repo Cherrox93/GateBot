@@ -2006,15 +2006,6 @@ class ScalperEngine:
             self.log("[RECOVERY] Brak zapisanych pozycji — czyste uruchomienie")
             return
 
-        # Fetch balances to verify positions still exist on exchange
-        try:
-            balances = await loop.run_in_executor(
-                None, lambda: self.exchange_client.fetch_balance()
-            )
-        except Exception as e:
-            self.log(f"[RECOVERY] Błąd pobierania balansu: {e}")
-            return
-
         for filepath in position_files:
             try:
                 with open(filepath, "r") as f:
@@ -2037,12 +2028,43 @@ class ScalperEngine:
                 os.remove(filepath)
                 continue
 
-            # Verify position still exists on exchange
+            # Verify position still exists on exchange — fresh balance per symbol
+            ccxt_sym = symbol.replace("_", "/")
             base_currency = symbol.split("_")[0]
-            held = float(balances.get(base_currency, {}).get("free", 0.0))
-            if held <= 0:
-                self.log(f"[RECOVERY] {symbol}: brak {base_currency} na giełdzie — usuwam plik")
-                os.remove(filepath)
+            try:
+                balances = await loop.run_in_executor(
+                    None, lambda: self.exchange_client.fetch_balance()
+                )
+                held = float(
+                    (balances.get(base_currency) or {}).get("free") or 0.0
+                )
+            except Exception as e:
+                self.log(f"[RECOVERY] Błąd fetch_balance dla {symbol}: {e}")
+                continue
+
+            # Minimalna wartość pozycji do odzyskania = 2$
+            if held > 0:
+                try:
+                    ticker = await loop.run_in_executor(
+                        None,
+                        lambda s=ccxt_sym: self.exchange_client.fetch_ticker(s)
+                    )
+                    current_price = float(
+                        ticker.get("last") or ticker.get("bid") or 0.0
+                    )
+                except Exception:
+                    current_price = 0.0
+                notional = held * current_price if current_price > 0 else 0.0
+            else:
+                notional = 0.0
+
+            if held <= 0 or notional < 2.0:
+                self.log(
+                    f"[RECOVERY] {symbol}: held={held:.8f} {base_currency} "
+                    f"notional={notional:.2f}$ — pozycja zamknięta, "
+                    f"usuwam plik JSON"
+                )
+                self._clear_position_file(symbol)
                 continue
 
             sl_price = entry_price * (1 - direction * sl_pct)
