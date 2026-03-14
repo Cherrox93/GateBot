@@ -1190,6 +1190,12 @@ class ScalperEngine:
         if self._stats_cache and now - self._stats_cache_ts < self._stats_cache_ttl:
             return self._stats_cache
 
+        def _safe_float(val, default: float = 0.0) -> float:
+            try:
+                return float(val) if val is not None else default
+            except (TypeError, ValueError):
+                return default
+
         try:
             loop = asyncio.get_running_loop()
 
@@ -1197,8 +1203,8 @@ class ScalperEngine:
             balance_data = await loop.run_in_executor(
                 None, lambda: self.exchange_client.fetch_balance()
             )
-            usdt_free = float(balance_data.get("USDT", {}).get("free", 0.0))
-            usdt_total = float(balance_data.get("USDT", {}).get("total", 0.0))
+            usdt_free  = _safe_float((balance_data.get("USDT") or {}).get("free"))
+            usdt_total = _safe_float((balance_data.get("USDT") or {}).get("total"))
 
             # 2) Trade history from exchange (since session start)
             since_ms = int(self._session_start_time * 1000)
@@ -1226,21 +1232,21 @@ class ScalperEngine:
             matched_fee: float = 0.0
             for sell in sells:
                 sym = sell.get("symbol")
-                sell_ts = float(sell.get("timestamp", 0))
+                sell_ts = _safe_float(sell.get("timestamp"))
                 candidates = [
                     b for b in buys
                     if b.get("symbol") == sym
-                    and float(b.get("timestamp", 0)) < sell_ts
+                    and _safe_float(b.get("timestamp")) < sell_ts
                     and b.get("id") not in matched_buy_ids
                 ]
                 if not candidates:
                     continue
-                matching_buy = max(candidates, key=lambda b: float(b.get("timestamp", 0)))
+                matching_buy = max(candidates, key=lambda b: _safe_float(b.get("timestamp")))
                 matched_buy_ids.add(matching_buy.get("id"))
-                sell_cost = float(sell.get("cost", 0.0))
-                buy_cost = float(matching_buy.get("cost", 0.0))
-                sell_fee = float(sell.get("fee", {}).get("cost", 0.0))
-                buy_fee = float(matching_buy.get("fee", {}).get("cost", 0.0))
+                sell_cost = _safe_float(sell.get("cost"))
+                buy_cost  = _safe_float(matching_buy.get("cost"))
+                sell_fee  = _safe_float((sell.get("fee") or {}).get("cost"))
+                buy_fee   = _safe_float((matching_buy.get("fee") or {}).get("cost"))
                 matched_pnl += sell_cost - buy_cost
                 matched_fee += sell_fee + buy_fee
 
@@ -1253,7 +1259,7 @@ class ScalperEngine:
             ).timestamp() * 1000
             today_trades = [
                 t for t in all_trades
-                if float(t.get("timestamp", 0)) >= today_start
+                if _safe_float(t.get("timestamp")) >= today_start
             ]
             today_buys = [t for t in today_trades if t.get("side") == "buy"]
             today_sells = [t for t in today_trades if t.get("side") == "sell"]
@@ -1262,20 +1268,20 @@ class ScalperEngine:
             today_fee: float = 0.0
             for sell in today_sells:
                 sym = sell.get("symbol")
-                sell_ts = float(sell.get("timestamp", 0))
+                sell_ts = _safe_float(sell.get("timestamp"))
                 candidates = [
                     b for b in today_buys
                     if b.get("symbol") == sym
-                    and float(b.get("timestamp", 0)) < sell_ts
+                    and _safe_float(b.get("timestamp")) < sell_ts
                     and b.get("id") not in today_matched_buy_ids
                 ]
                 if not candidates:
                     continue
-                matching_buy = max(candidates, key=lambda b: float(b.get("timestamp", 0)))
+                matching_buy = max(candidates, key=lambda b: _safe_float(b.get("timestamp")))
                 today_matched_buy_ids.add(matching_buy.get("id"))
-                sell_fee = float(sell.get("fee", {}).get("cost", 0.0))
-                buy_fee = float(matching_buy.get("fee", {}).get("cost", 0.0))
-                daily_pnl += float(sell.get("cost", 0.0)) - float(matching_buy.get("cost", 0.0))
+                sell_fee = _safe_float((sell.get("fee") or {}).get("cost"))
+                buy_fee  = _safe_float((matching_buy.get("fee") or {}).get("cost"))
+                daily_pnl += _safe_float(sell.get("cost")) - _safe_float(matching_buy.get("cost"))
                 today_fee += sell_fee + buy_fee
             daily_pnl -= today_fee
 
@@ -1287,11 +1293,11 @@ class ScalperEngine:
                 matching_buys = [
                     b for b in buys
                     if b.get("symbol") == sym
-                    and float(b.get("timestamp", 0)) < float(sell.get("timestamp", 0))
+                    and _safe_float(b.get("timestamp")) < _safe_float(sell.get("timestamp"))
                 ]
                 if matching_buys:
-                    last_buy = max(matching_buys, key=lambda b: float(b.get("timestamp", 0)))
-                    if float(sell.get("price", 0)) > float(last_buy.get("price", 0)):
+                    last_buy = max(matching_buys, key=lambda b: _safe_float(b.get("timestamp")))
+                    if _safe_float(sell.get("price")) > _safe_float(last_buy.get("price")):
                         wins += 1
                     else:
                         losses += 1
