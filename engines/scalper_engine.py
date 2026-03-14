@@ -1305,8 +1305,18 @@ class ScalperEngine:
                 positions_value += float(pos_data.get("stake", 0.0))
             equity = usdt_free + positions_value
 
-            # Session PnL = current equity - starting equity (always correct)
-            session_pnl = equity - self._start_equity
+            # Session PnL = suma zamkniętych tradów w tej sesji
+            # NIE używamy equity diff — balance_cache może być stale
+            session_pnl = matched_pnl - matched_fee
+
+            # Equity diff jako secondary check
+            equity_diff = equity - self._start_equity
+            if abs(equity_diff - session_pnl) > 5.0:
+                print(
+                    f"[STATS] WARN: session_pnl mismatch "
+                    f"matched={session_pnl:.2f} equity_diff={equity_diff:.2f}",
+                    flush=True,
+                )
 
             stats = {
                 "bot": "scalper",
@@ -1316,10 +1326,10 @@ class ScalperEngine:
                 "session_pnl": round(session_pnl, 2),
                 "daily_pnl": round(daily_pnl, 4),
                 "total_fee_paid": round(total_fee, 4),
-                "wins": wins,
-                "losses": losses,
-                "total_trades": total_trades,
-                "win_rate": win_rate,
+                "wins": self._session_wins,
+                "losses": self._session_losses,
+                "total_trades": self._session_wins + self._session_losses,
+                "win_rate": round(self._session_wins / (self._session_wins + self._session_losses) * 100, 1) if (self._session_wins + self._session_losses) > 0 else 0.0,
                 "effective_stake": self._calc_effective_stake(),
                 "open_positions": self._state.count(),
                 "last_updated": datetime.now().strftime("%H:%M:%S"),
@@ -2000,6 +2010,15 @@ class ScalperEngine:
 
         await self._recover_open_positions()
 
+        # Ustaw start equity po recovery — świeży balance + pozycje
+        _bal = await self._get_available_balance()
+        _pos_val = sum(
+            float(p.get("stake", 0.0))
+            for p in self._state.as_dict().values()
+        )
+        self._start_equity = _bal + _pos_val
+        self.log(f"[STATS] Start equity: {self._start_equity:.2f}$")
+
         if self._warmup_ready():
             self._refresh_scalper_pairs()
 
@@ -2534,37 +2553,26 @@ class ScalperEngine:
         net_pnl = _real_pnl if _real_pnl is not None \
             else round(result.pnl_usd - result.fee_paid, 2)
 
+        # Natychmiastowa aktualizacja bez czekania na _fetch_trade_stats
         if net_pnl >= 0:
             self._session_wins += 1
         else:
             self._session_losses += 1
 
-        # Natychmiast zaktualizuj stats_cache lokalnie
-        self._stats_cache["wins"] = self._session_wins
-        self._stats_cache["losses"] = self._session_losses
         _total = self._session_wins + self._session_losses
-        self._stats_cache["win_rate"] = round(
-            self._session_wins / _total * 100, 1
-        ) if _total > 0 else 0.0
+        _wr = round(self._session_wins / _total * 100, 1) if _total > 0 else 0.0
+
+        # Zaktualizuj tylko W/L/WR/session_pnl w cache — reszta odświeży się async
+        _current_session_pnl = self._stats_cache.get("session_pnl", 0.0) + net_pnl
+        self._stats_cache.update({
+            "wins": self._session_wins,
+            "losses": self._session_losses,
+            "win_rate": _wr,
+            "session_pnl": round(_current_session_pnl, 2),
+        })
 
         self._invalidate_balance_cache()  # force fresh balance on next check
         self._stats_cache_ts = 0.0        # invalidate stats cache — force refresh
-
-        # Odśwież balance natychmiast po trade
-        try:
-            _fresh_bal = await self._get_available_balance()
-            _positions_val = sum(
-                float(p.get("stake", 0.0))
-                for p in self._state.as_dict().values()
-            )
-            _fresh_equity = _fresh_bal + _positions_val
-            _fresh_session_pnl = _fresh_equity - self._start_equity
-            # Zaktualizuj tylko kluczowe pola w cache — reszta odświeży się async
-            self._stats_cache["usdt_free"] = round(_fresh_bal, 2)
-            self._stats_cache["equity"] = round(_fresh_equity, 2)
-            self._stats_cache["session_pnl"] = round(_fresh_session_pnl, 2)
-        except Exception:
-            pass
 
         # ── Circuit breaker: 3 consecutive SL losses → 20 min pause ──
         if net_pnl < 0:
