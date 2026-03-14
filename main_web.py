@@ -694,6 +694,9 @@ async def start_bot(bot: str, user=Depends(verify_token)):
     global market_data, scalper_engine, lowcap_engine, grid_bot_engine
 
     if bot == "scalper" and not scalper_state.running:
+        # Synchronizuj stan — jeśli engine już nie działa, wymuś reset
+        if scalper_engine.running:
+            scalper_engine.running = False
         await scalper_engine.start()
         scalper_state.running = True
     elif bot == "lowcap" and not lowcap_state.running:
@@ -711,8 +714,11 @@ async def start_bot(bot: str, user=Depends(verify_token)):
 @app.post("/api/stop/{bot}")
 async def stop_bot(bot: str, user=Depends(verify_token)):
     if bot == "scalper" and scalper_state.running:
-        await scalper_engine.stop()
+        # Ustaw running=False PRZED stop() — stop() może trwać minuty
+        # Jeśli HTTP timeout → scalper_state.running musi być False
+        # żeby start() mógł ponownie uruchomić bota
         scalper_state.running = False
+        await scalper_engine.stop()
     elif bot == "lowcap" and lowcap_state.running:
         lowcap_engine.stop()
         lowcap_state.running = False

@@ -643,6 +643,20 @@ class ExecutionEngine:
                 f"after 3 attempts"
             )
 
+        # Zaokrąglij do precyzji akceptowanej przez Gate.io
+        # Bez tego Gate.io odrzuci order lub zaokrągli w dół → dust
+        try:
+            sell_qty = float(
+                self.exchange.amount_to_precision(ccxt_sym, sell_qty)
+            )
+        except Exception:
+            pass  # fallback — wyślij oryginalną wartość
+
+        if sell_qty <= 0:
+            raise ValueError(
+                f"qty_zero_after_precision for {base_currency}"
+            )
+
         # Sprawdź minimalną wartość zlecenia (~1 USDT)
         cached = self._cache.get_top_of_book(pos.symbol) if self._cache else None
         if cached:
@@ -693,24 +707,35 @@ class ExecutionEngine:
                         (bal_after.get(base_currency) or {}).get("free") or 0.0
                     )
                     if remaining > 0:
-                        cached = self._cache.get_top_of_book(pos.symbol) \
-                            if self._cache else None
-                        if cached:
-                            dust_notional = remaining * (
-                                (cached[0] + cached[1]) / 2.0
+                        # Zaokrąglij dust do precyzji giełdy
+                        try:
+                            remaining = float(
+                                self.exchange.amount_to_precision(
+                                    ccxt_sym, remaining
+                                )
                             )
-                            if dust_notional >= 1.0:
-                                # Dust jest handlowalny — sprzedaj
-                                print(
-                                    f"[{pos.symbol}] Sprzedaję pozostały dust: "
-                                    f"{remaining:.8f} {base_currency} "
-                                    f"≈ {dust_notional:.4f} USDT",
-                                    flush=True,
+                        except Exception:
+                            pass
+                        if remaining <= 0:
+                            pass  # precision zaokrągliło do 0 — dust jest sub-precision
+                        else:
+                            cached = self._cache.get_top_of_book(pos.symbol) \
+                                if self._cache else None
+                            if cached:
+                                dust_notional = remaining * (
+                                    (cached[0] + cached[1]) / 2.0
                                 )
-                                await self._call(
-                                    self.exchange.create_order,
-                                    ccxt_sym, "market", side, remaining
-                                )
+                                if dust_notional >= 1.0:
+                                    print(
+                                        f"[{pos.symbol}] Sprzedaję pozostały dust: "
+                                        f"{remaining:.8f} {base_currency} "
+                                        f"≈ {dust_notional:.4f} USDT",
+                                        flush=True,
+                                    )
+                                    await self._call(
+                                        self.exchange.create_order,
+                                        ccxt_sym, "market", side, remaining
+                                    )
                 except Exception as dust_err:
                     print(
                         f"[{pos.symbol}] dust cleanup error (non-fatal): "
@@ -805,7 +830,13 @@ class ExecutionEngine:
         """
         ccxt_sym = self._ccxt(signal.symbol)
         side = "buy" if signal.direction == 1 else "sell"
-        qty = round(stake / signal.entry_price, 6)  # Gate.io max 6 decimals
+        # Użyj ccxt precision — różne pary mają różne wymagania
+        try:
+            qty = float(self.exchange.amount_to_precision(
+                ccxt_sym, stake / signal.entry_price
+            ))
+        except Exception:
+            qty = round(stake / signal.entry_price, 6)
         if qty <= 0:
             return self._missed(signal, stake, "qty_zero")
         print(f"[ORDER] Attempting {signal.symbol} {side} qty={qty} "
@@ -944,8 +975,8 @@ class ExecutionEngine:
             await asyncio.sleep(MONITOR_POLL_SEC)
             now = time.time()
 
-            # Co 60s sprawdź czy pozycja nadal istnieje na giełdzie
-            if now - _balance_check_last >= 60.0:
+            # Co 15s sprawdź czy pozycja nadal istnieje na giełdzie
+            if now - _balance_check_last >= 15.0:
                 _balance_check_last = now
                 try:
                     base_currency = ccxt_sym.split("/")[0]
@@ -2244,8 +2275,9 @@ class ScalperEngine:
         """
         Graceful stop:
         1. Natychmiast przestaje przyjmować nowe sygnały
-        2. Czeka aż wszystkie aktywne pozycje się zamkną (TP/Runner/SL)
-        3. Dopiero potem anuluje taski i zatrzymuje silnik
+        2. Aktywnie weryfikuje pozycje na giełdzie — czyści ghost positions
+        3. Czeka max 5 minut na zamknięcie pozycji przez _monitor()
+        4. Dopiero potem anuluje taski i zatrzymuje silnik
         """
         self._accepting_signals = False
 
@@ -2254,26 +2286,63 @@ class ScalperEngine:
         self.gui_log(msg)
         asyncio.create_task(self._tg(msg))
 
-        # Czekaj aż wszystkie pozycje się zamkną — max 30 minut
+        # Czekaj max 5 minut — co 10s aktywnie sprawdzaj giełdę
         _wait_start = time.time()
-        _max_wait = 1800.0
+        _max_wait = 300.0  # 5 minut
+        _last_exchange_check = 0.0
+
         while self._state.count() > 0:
-            if time.time() - _wait_start > _max_wait:
-                msg = "⚠️ SCALPER STOP: Timeout 30min — wymuszam zamknięcie"
+            elapsed = time.time() - _wait_start
+            if elapsed > _max_wait:
+                msg = "⚠️ SCALPER STOP: Timeout 5min — wymuszam zamknięcie"
                 self.log(msg)
                 await self._tg(msg)
                 break
-            # Co 30 sekund loguj status
-            if int(time.time() - _wait_start) % 30 == 0 and int(time.time() - _wait_start) > 0:
+
+            # Co 10s aktywnie sprawdź na giełdzie czy pozycje nadal istnieją
+            if time.time() - _last_exchange_check >= 10.0:
+                _last_exchange_check = time.time()
+                try:
+                    loop = asyncio.get_running_loop()
+                    bal = await loop.run_in_executor(
+                        None, lambda: self.exchange_client.fetch_balance()
+                    )
+                    open_positions = dict(self._state.as_dict())
+                    for sym, pos_info in open_positions.items():
+                        ccxt_sym = sym.replace("_", "/")
+                        base_currency = ccxt_sym.split("/")[0]
+                        held = float(
+                            (bal.get(base_currency) or {}).get("free") or 0.0
+                        )
+                        # Jeśli na giełdzie nie ma tego asseta — ghost position
+                        if held < 0.001:
+                            self.log(
+                                f"[STOP] {sym}: brak na giełdzie "
+                                f"(held={held:.8f}) — usuwam ghost position"
+                            )
+                            self._state.remove(sym)
+                            self._clear_position_file(sym)
+                            self._broadcast_position_closed(sym)
+                except Exception as e:
+                    self.log(f"[STOP] Błąd weryfikacji pozycji: {e}")
+
+            # Co 30s loguj status
+            if int(elapsed) > 0 and int(elapsed) % 30 == 0:
                 open_syms = list(self._state.as_dict().keys())
-                self.log(f"[STOP] Czekam na pozycje: {open_syms}")
-            await asyncio.sleep(1.0)
+                if open_syms:
+                    self.log(f"[STOP] Czekam na pozycje: {open_syms}")
+
+            await asyncio.sleep(2.0)
 
         self.running = False
 
         open_syms = list(self._state.as_dict().keys())
         if open_syms:
-            msg = f"⚠️ SCALPER STOP: Wymuszono z otwartymi pozycjami: {open_syms}"
+            # Ostateczne czyszczenie — usuń wszystkie pozostałe pozycje z _state
+            for sym in open_syms:
+                self._state.remove(sym)
+                self._clear_position_file(sym)
+            msg = f"⚠️ SCALPER STOP: Wyczyszczono ghost pozycje: {open_syms}"
         else:
             msg = "🛑 SCALPER STOP: Wszystkie pozycje zamknięte"
         self.log(msg)
