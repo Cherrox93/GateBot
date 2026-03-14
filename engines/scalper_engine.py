@@ -1137,6 +1137,9 @@ class ScalperEngine:
         self._start_equity: float = self._balance_cache
         self._day_start = datetime.now().date()
         self._debug_last_print: dict[str, float] = {}
+        self._accepting_signals: bool = True
+        self._session_wins: int = 0
+        self._session_losses: int = 0
         self._consecutive_losses: int = 0
         self._circuit_breaker_until: float = 0.0
         self._exec_attempts = 0
@@ -1776,12 +1779,10 @@ class ScalperEngine:
         return f
 
     def _wr_text(self) -> str:
-        stats = self._stats_cache
-        if not stats:
-            return "W:0 L:0"
-        w = stats.get("wins", 0)
-        l = stats.get("losses", 0)
-        wr = stats.get("win_rate", 0.0)
+        w = self._session_wins
+        l = self._session_losses
+        total = w + l
+        wr = round(w / total * 100, 1) if total > 0 else 0.0
         return f"W:{w} L:{l} WR:{wr:.0f}%"
 
     def _warmup_ready(self) -> bool:
@@ -1863,91 +1864,107 @@ class ScalperEngine:
                 self.tg.start_polling_async(self._handle_command)
             )
 
+    def _save_position(self, pos_data: dict) -> None:
+        """Zapisz otwartą pozycję do pliku JSON na dysku."""
+        import json as _json
+        try:
+            path = f"position_{pos_data['symbol'].replace('/', '_')}.json"
+            with open(path, "w") as f:
+                _json.dump(pos_data, f)
+            self.log(f"[RECOVERY] Zapisano pozycję: {path}")
+        except Exception as e:
+            self.log(f"[RECOVERY] Błąd zapisu pozycji: {e}")
+
+    def _clear_position_file(self, symbol: str) -> None:
+        """Usuń plik pozycji po jej zamknięciu."""
+        import os
+        try:
+            path = f"position_{symbol.replace('/', '_')}.json"
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
     async def _recover_open_positions(self) -> None:
         """
-        On startup, query Gate.io for any open orders and open balances
-        that match our trading symbols. Reconstruct OpenPosition objects
-        and resume SL monitoring for each recovered position.
-        Called once from _run() before WebSocket and symbol tasks start.
+        Odczytuje zapisane pliki pozycji z dysku i wznawia monitoring.
+        Używa oryginalnych cen wejścia/TP/SL — nie rekonstruuje z giełdy.
         """
+        import json as _json
+        import os
+        import glob as _glob
         loop = asyncio.get_running_loop()
         recovered = 0
 
+        position_files = _glob.glob("position_*.json")
+        if not position_files:
+            self.log("[RECOVERY] Brak zapisanych pozycji — czyste uruchomienie")
+            return
+
+        # Fetch balances to verify positions still exist on exchange
         try:
-            # Fetch all open orders on spot
-            open_orders = await loop.run_in_executor(
-                None, lambda: self.exchange_client.fetch_open_orders()
-            )
-            # Fetch current balances to detect held assets
             balances = await loop.run_in_executor(
                 None, lambda: self.exchange_client.fetch_balance()
             )
         except Exception as e:
-            self.log(f"[RECOVERY] Błąd pobierania danych z giełdy: {e}")
+            self.log(f"[RECOVERY] Błąd pobierania balansu: {e}")
             return
 
-        for symbol in self._symbols:
+        for filepath in position_files:
+            try:
+                with open(filepath, "r") as f:
+                    pos_data = _json.load(f)
+            except Exception as e:
+                self.log(f"[RECOVERY] Błąd odczytu {filepath}: {e}")
+                continue
+
+            symbol = pos_data.get("symbol", "")
+            entry_price = float(pos_data.get("entry_price", 0))
+            tp_price = float(pos_data.get("tp_price", 0))
+            sl_pct = float(pos_data.get("sl_pct", float(self.cfg.stop_loss_pct)))
+            stake = float(pos_data.get("stake", 0))
+            direction = int(pos_data.get("direction", 1))
+            strategy = pos_data.get("strategy", "recovered")
+            entry_time = float(pos_data.get("entry_time", time.time()))
+
+            if not symbol or entry_price <= 0:
+                self.log(f"[RECOVERY] Plik {filepath} — brak danych, pomijam")
+                os.remove(filepath)
+                continue
+
+            # Verify position still exists on exchange
             base_currency = symbol.split("_")[0]
             held = float(balances.get(base_currency, {}).get("free", 0.0))
             if held <= 0:
+                self.log(f"[RECOVERY] {symbol}: brak {base_currency} na giełdzie — usuwam plik")
+                os.remove(filepath)
                 continue
 
-            ccxt_sym = symbol.replace("_", "/")
-            sym_orders = [o for o in open_orders if o.get("symbol") == ccxt_sym]
-
-            # KEY GUARD: only recover if there is an open order on exchange.
-            # A position without an open order was either manually closed,
-            # or is dust — do not reconstruct it.
-            if not sym_orders:
-                self.log(
-                    f"[RECOVERY] {symbol}: held={held:.6f} {base_currency} "
-                    f"but no open orders → skipping (manually closed or dust)"
-                )
-                continue
-
-            tp_order_id = sym_orders[0]["id"]
-
-            try:
-                ticker = await loop.run_in_executor(
-                    None, lambda: self.exchange_client.fetch_ticker(ccxt_sym)
-                )
-                current_price = float(ticker.get("last") or ticker.get("bid") or 0.0)
-            except Exception:
-                current_price = 0.0
-
-            if current_price <= 0:
-                continue
-
-            stake = held * current_price
-            if stake < 2.0:
-                self.log(f"[RECOVERY] {symbol}: stake={stake:.2f}$ < 2$ — dust, skipping")
-                continue
-
-            atr = self._cache.get_atr_1m_pct(symbol)
-            recovery_sl_pct = max(atr * 1.3, float(self.cfg.stop_loss_pct))
+            sl_price = entry_price * (1 - direction * sl_pct)
 
             pos = OpenPosition(
                 symbol=symbol,
-                direction=1,
-                entry_price=current_price,
-                tp_price=current_price * (1 + TARGET_PROFIT_PCT),
-                sl_price=current_price * (1 - recovery_sl_pct),
-                sl_pct=recovery_sl_pct,
+                direction=direction,
+                entry_price=entry_price,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                sl_pct=sl_pct,
                 qty=held,
                 stake=stake,
-                entry_time=time.time(),
+                entry_time=entry_time,
                 entry_order_id="recovered",
-                tp_order_id=tp_order_id,
-                strategy="recovered",
+                tp_order_id="",
+                strategy=strategy,
             )
 
             self._state.add(pos)
             recovered += 1
+            ccxt_sym = symbol.replace("_", "/")
 
             msg = (
                 f"♻️ RECOVERY: {symbol} | held={held:.6f} {base_currency}"
-                f" | ~price={current_price:.4f} | SL={pos.sl_price:.4f}"
-                f" | TP_order={tp_order_id}"
+                f" | entry={entry_price:.4f} | TP={tp_price:.4f}"
+                f" | SL={sl_price:.4f} | strategy={strategy}"
             )
             self.log(msg)
             await self._tg(msg)
@@ -1994,15 +2011,50 @@ class ScalperEngine:
             await asyncio.sleep(1.0)
 
     async def stop(self) -> None:
-        """Async stop — cancels all tasks gracefully."""
+        """
+        Graceful stop:
+        1. Natychmiast przestaje przyjmować nowe sygnały
+        2. Czeka aż wszystkie aktywne pozycje się zamkną (TP/Runner/SL)
+        3. Dopiero potem anuluje taski i zatrzymuje silnik
+        """
+        self._accepting_signals = False
+
+        msg = "⏸️ SCALPER: Zatrzymuję nowe wejścia — czekam na zamknięcie pozycji..."
+        self.log(msg)
+        self.gui_log(msg)
+        asyncio.create_task(self._tg(msg))
+
+        # Czekaj aż wszystkie pozycje się zamkną — max 30 minut
+        _wait_start = time.time()
+        _max_wait = 1800.0
+        while self._state.count() > 0:
+            if time.time() - _wait_start > _max_wait:
+                msg = "⚠️ SCALPER STOP: Timeout 30min — wymuszam zamknięcie"
+                self.log(msg)
+                await self._tg(msg)
+                break
+            # Co 30 sekund loguj status
+            if int(time.time() - _wait_start) % 30 == 0 and int(time.time() - _wait_start) > 0:
+                open_syms = list(self._state.as_dict().keys())
+                self.log(f"[STOP] Czekam na pozycje: {open_syms}")
+            await asyncio.sleep(1.0)
+
         self.running = False
 
+        open_syms = list(self._state.as_dict().keys())
+        if open_syms:
+            msg = f"⚠️ SCALPER STOP: Wymuszono z otwartymi pozycjami: {open_syms}"
+        else:
+            msg = "🛑 SCALPER STOP: Wszystkie pozycje zamknięte"
+        self.log(msg)
+        self.gui_log(msg)
+        await self._tg(msg)
+
+        # Anuluj taski dopiero po zamknięciu pozycji
         if self._poll_task:
             self._poll_task.cancel()
             try:
                 await self._poll_task
-            except asyncio.CancelledError:
-                pass
             except Exception:
                 pass
             self._poll_task = None
@@ -2011,8 +2063,6 @@ class ScalperEngine:
             self._pair_task.cancel()
             try:
                 await self._pair_task
-            except asyncio.CancelledError:
-                pass
             except Exception:
                 pass
             self._pair_task = None
@@ -2021,8 +2071,6 @@ class ScalperEngine:
             self._ws_task.cancel()
             try:
                 await self._ws_task
-            except asyncio.CancelledError:
-                pass
             except Exception:
                 pass
 
@@ -2034,8 +2082,6 @@ class ScalperEngine:
             self.main_task.cancel()
             try:
                 await self.main_task
-            except asyncio.CancelledError:
-                pass
             except Exception:
                 pass
             self.main_task = None
@@ -2124,6 +2170,8 @@ class ScalperEngine:
 
     async def _process_symbol(self, symbol: str) -> None:
         """Momentum + pullback retail entry pipeline."""
+        if not self._accepting_signals:
+            return
         # Early exit if max positions already filled — no point scanning
         max_pos = int(getattr(self.cfg, "slot_count", self.cfg.max_open_positions))
         if self._state.count() >= max_pos:
@@ -2388,6 +2436,17 @@ class ScalperEngine:
             self._trade_rate_window.append(now)
             ml_features = self._collect_ml_features(signal.symbol, signal, features, snapshot)
             self._log_signal(signal, stake)
+            # Zapisz pozycję na dysk przed wykonaniem — recovery na wypadek restartu
+            self._save_position({
+                "symbol": signal.symbol,
+                "entry_price": signal.entry_price,
+                "tp_price": signal.entry_price * (1 + signal.tp_pct),
+                "sl_pct": float(self.cfg.stop_loss_pct),
+                "stake": stake,
+                "direction": signal.direction,
+                "strategy": signal.strategy,
+                "entry_time": time.time(),
+            })
             asyncio.create_task(self._execute_and_record(signal, stake, ml_features))
 
     async def _execute_and_record(self, signal: Signal, stake: float,
@@ -2442,6 +2501,7 @@ class ScalperEngine:
         except Exception as exc:
             self.log(f"[{signal.symbol}] execution error: {exc}")
             self._state.remove(signal.symbol)
+            self._clear_position_file(signal.symbol)
             self._trade_ids.pop(signal.symbol, None)
             self._retry_after[signal.symbol] = time.time() + MISSED_RETRY_COOLDOWN_SEC
             self._invalidate_balance_cache()
@@ -2450,6 +2510,7 @@ class ScalperEngine:
             return
 
         self._state.remove(signal.symbol)
+        self._clear_position_file(signal.symbol)
         self._broadcast_position_closed(signal.symbol)
 
         if result.exit_reason == "MISSED":
@@ -2473,8 +2534,37 @@ class ScalperEngine:
         net_pnl = _real_pnl if _real_pnl is not None \
             else round(result.pnl_usd - result.fee_paid, 2)
 
+        if net_pnl >= 0:
+            self._session_wins += 1
+        else:
+            self._session_losses += 1
+
+        # Natychmiast zaktualizuj stats_cache lokalnie
+        self._stats_cache["wins"] = self._session_wins
+        self._stats_cache["losses"] = self._session_losses
+        _total = self._session_wins + self._session_losses
+        self._stats_cache["win_rate"] = round(
+            self._session_wins / _total * 100, 1
+        ) if _total > 0 else 0.0
+
         self._invalidate_balance_cache()  # force fresh balance on next check
         self._stats_cache_ts = 0.0        # invalidate stats cache — force refresh
+
+        # Odśwież balance natychmiast po trade
+        try:
+            _fresh_bal = await self._get_available_balance()
+            _positions_val = sum(
+                float(p.get("stake", 0.0))
+                for p in self._state.as_dict().values()
+            )
+            _fresh_equity = _fresh_bal + _positions_val
+            _fresh_session_pnl = _fresh_equity - self._start_equity
+            # Zaktualizuj tylko kluczowe pola w cache — reszta odświeży się async
+            self._stats_cache["usdt_free"] = round(_fresh_bal, 2)
+            self._stats_cache["equity"] = round(_fresh_equity, 2)
+            self._stats_cache["session_pnl"] = round(_fresh_session_pnl, 2)
+        except Exception:
+            pass
 
         # ── Circuit breaker: 3 consecutive SL losses → 20 min pause ──
         if net_pnl < 0:
