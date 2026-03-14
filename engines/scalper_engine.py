@@ -888,6 +888,36 @@ class ExecutionEngine:
             await asyncio.sleep(MONITOR_POLL_SEC)
             now = time.time()
 
+            # Co 30s sprawdź czy pozycja nadal istnieje na giełdzie
+            if not hasattr(self, '_last_balance_check'):
+                self._last_balance_check = 0.0
+            if now - self._last_balance_check >= 30.0:
+                self._last_balance_check = now
+                try:
+                    base_currency = ccxt_sym.split("/")[0]
+                    loop = asyncio.get_running_loop()
+                    bal = await loop.run_in_executor(
+                        None, lambda: self.exchange.fetch_balance()
+                    )
+                    available = float(
+                        (bal.get(base_currency) or {}).get("free") or 0.0
+                    )
+                    # Jeśli saldo < 5% oryginalnej qty — pozycja zamknięta manualnie
+                    if available < pos.qty * 0.05:
+                        print(
+                            f"[{pos.symbol}] MANUAL_CLOSE wykryty — "
+                            f"saldo {base_currency}={available:.8f} "
+                            f"< qty={pos.qty:.8f}",
+                            flush=True,
+                        )
+                        exit_reason = "MANUAL_CLOSE"
+                        exit_price = self._get_cached_price(
+                            pos.symbol, pos.entry_price
+                        )
+                        break
+                except Exception as e:
+                    print(f"[{pos.symbol}] balance check error: {e}", flush=True)
+
             # b) current price — WebSocket cache first, REST fallback
             current = self._get_cached_price(pos.symbol, 0.0)
             if current <= 0:
@@ -1147,6 +1177,72 @@ class ScalperEngine:
         self._exec_missed = 0
         self._exec_fill_latencies: deque[float] = deque(maxlen=500)
 
+    # ── Real equity from Gate.io ────────────────────────────────────────────
+
+    async def get_real_equity(self) -> dict:
+        """
+        Pobiera prawdziwe dane portfela z Gate.io.
+        Zwraca: usdt_free, equity, engaged
+        Bez żadnych lokalnych szacunków.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            balance = await loop.run_in_executor(
+                None, lambda: self.exchange_client.fetch_balance()
+            )
+
+            # Wolny USDT
+            usdt_free = float(
+                (balance.get("USDT") or {}).get("free") or 0.0
+            )
+
+            # Wartość trzymanych base assets (np. BTC, ETH, SOL)
+            # przeliczona na USDT po aktualnej cenie rynkowej
+            assets_value = 0.0
+            for symbol_raw in self._symbols:
+                base = symbol_raw.split("_")[0]
+                held = float(
+                    (balance.get(base) or {}).get("total") or 0.0
+                )
+                if held <= 0:
+                    continue
+                # Pobierz cenę z WebSocket cache — zero latency
+                top = self._cache.get_top_of_book(symbol_raw)
+                if top:
+                    price = (top[0] + top[1]) / 2.0
+                else:
+                    # Fallback REST
+                    try:
+                        ccxt_sym = symbol_raw.replace("_", "/")
+                        ticker = await loop.run_in_executor(
+                            None,
+                            lambda s=ccxt_sym: self.exchange_client.fetch_ticker(s)
+                        )
+                        price = float(
+                            ticker.get("last") or ticker.get("bid") or 0.0
+                        )
+                    except Exception:
+                        price = 0.0
+                if price > 0:
+                    assets_value += held * price
+
+            equity = usdt_free + assets_value
+            engaged = assets_value
+
+            return {
+                "usdt_free": round(usdt_free, 2),
+                "equity": round(equity, 2),
+                "engaged": round(engaged, 2),
+            }
+
+        except Exception as e:
+            self.log(f"[EQUITY] Błąd: {e}")
+            return {
+                "usdt_free": 0.0,
+                "equity": 0.0,
+                "engaged": 0.0,
+            }
+
     # ── Balance — always from exchange, cached 2s ─────────────────────────────
 
     @property
@@ -1199,12 +1295,11 @@ class ScalperEngine:
         try:
             loop = asyncio.get_running_loop()
 
-            # 1) Real balance
-            balance_data = await loop.run_in_executor(
-                None, lambda: self.exchange_client.fetch_balance()
-            )
-            usdt_free  = _safe_float((balance_data.get("USDT") or {}).get("free"))
-            usdt_total = _safe_float((balance_data.get("USDT") or {}).get("total"))
+            # 1) Real balance + equity from Gate.io
+            real = await self.get_real_equity()
+            usdt_free = real["usdt_free"]
+            equity = real["equity"]
+            positions_value = real["engaged"]
 
             # 2) Trade history from exchange (since session start)
             since_ms = int(self._session_start_time * 1000)
@@ -1305,12 +1400,6 @@ class ScalperEngine:
             total_trades = wins + losses
             win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
 
-            # Equity = free USDT + estimated value of open positions
-            positions_value = 0.0
-            for sym, pos_data in self._state.as_dict().items():
-                positions_value += float(pos_data.get("stake", 0.0))
-            equity = usdt_free + positions_value
-
             # Session PnL = suma zamkniętych tradów w tej sesji
             # NIE używamy equity diff — balance_cache może być stale
             session_pnl = matched_pnl - matched_fee
@@ -1327,8 +1416,8 @@ class ScalperEngine:
             stats = {
                 "bot": "scalper",
                 "usdt_free": round(usdt_free, 2),
-                "usdt_total": round(usdt_total, 2),
                 "equity": round(equity, 2),
+                "engaged": round(positions_value, 2),
                 "session_pnl": round(session_pnl, 2),
                 "daily_pnl": round(daily_pnl, 4),
                 "total_fee_paid": round(total_fee, 4),
@@ -2626,6 +2715,8 @@ class ScalperEngine:
             icon = "🔴"
         elif result.exit_reason == "TRAIL":
             icon = "📉"
+        elif result.exit_reason == "MANUAL_CLOSE":
+            icon = "🤚"
         else:
             icon = "⚠️"
         sign = "+" if net_pnl >= 0 else ""

@@ -726,21 +726,28 @@ async def stop_bot(bot: str, user=Depends(verify_token)):
     return {"ok": True}
 
 @app.get("/api/portfolio")
-def get_portfolio(user=Depends(verify_token)):
-    engines = [e for e in [scalper_engine, lowcap_engine, grid_bot_engine] if e]
-    exposure = get_total_exposure(engines)
-    # Live mode: use cached balance_usdt (refreshed by _run and _process_symbol)
+async def get_portfolio(user=Depends(verify_token)):
     if scalper_engine:
-        available = scalper_engine.balance_usdt
+        try:
+            stats = await scalper_engine._fetch_trade_stats()
+        except Exception:
+            stats = scalper_engine.bot_profit_summary
+        return {
+            "balance_usdt":   stats.get("usdt_free", 0.0),
+            "total_exposure": stats.get("engaged", 0.0),
+            "total_equity":   stats.get("equity", 0.0),
+            "start_balance":  round(scalper_engine._start_equity, 2),
+        }
     else:
         available = wallet.get_total("USDT")
-    equity = available + exposure
-    return {
-        "balance_usdt":   round(available, 2),
-        "total_exposure": round(exposure, 2),
-        "total_equity":   round(equity, 2),
-        "start_balance":  round(available, 2),
-    }
+        engines = [e for e in [scalper_engine, lowcap_engine, grid_bot_engine] if e]
+        exposure = get_total_exposure(engines)
+        return {
+            "balance_usdt":   round(available, 2),
+            "total_exposure": round(exposure, 2),
+            "total_equity":   round(available + exposure, 2),
+            "start_balance":  round(available, 2),
+        }
 
 @app.get("/api/settings")
 def get_settings(user=Depends(verify_token)):
