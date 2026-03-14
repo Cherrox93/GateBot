@@ -612,44 +612,55 @@ class ExecutionEngine:
 
     async def _market_sell(self, pos: OpenPosition, ccxt_sym: str) -> dict:
         side = "sell" if pos.direction == 1 else "buy"
-
-        # Fetch actual available balance of base currency to avoid BALANCE_NOT_ENOUGH.
-        # Gate.io deducts fees from base currency on buy, so held qty < pos.qty.
         base_currency = ccxt_sym.split("/")[0]
-        sell_qty = pos.qty
-        try:
-            loop = asyncio.get_running_loop()
-            bal = await loop.run_in_executor(
-                None, lambda: self.exchange.fetch_balance()
-            )
-            available = float(bal.get(base_currency, {}).get("free", 0.0))
-            if available <= 0:
-                raise ValueError(f"zero_available_balance for {base_currency}")
 
-            # Zawsze sprzedaj CAŁE dostępne saldo base currency
-            # — nie tylko pos.qty. Eliminuje dust po każdym trade.
-            sell_qty = available
-
-            # Gate.io wymaga minimalnej wartości zlecenia ~1 USDT
-            # Jeśli available jest dust-only (< 0.50$) — pomiń sprzedaż
-            top = self._cache.get_top_of_book(pos.symbol) if self._cache else None
-            if top:
-                current_price = (top[0] + top[1]) / 2.0
-                notional = sell_qty * current_price
-                if notional < 1.0:
-                    raise ValueError(
-                        f"dust_below_min_order: {sell_qty:.8f} {base_currency}"
-                        f" ≈ {notional:.4f} USDT — pomijam sprzedaż"
-                    )
-
-            if sell_qty < pos.qty * 0.95:
+        # Zawsze fetchuj RZECZYWISTE saldo — ignoruj pos.qty
+        # Gate.io pobiera fee z base currency przy BUY więc
+        # held < pos.qty. Sprzedajemy WSZYSTKO co jest na koncie.
+        sell_qty = 0.0
+        for attempt in range(3):
+            try:
+                loop = asyncio.get_running_loop()
+                bal = await loop.run_in_executor(
+                    None, lambda: self.exchange.fetch_balance()
+                )
+                available = float(
+                    (bal.get(base_currency) or {}).get("free") or 0.0
+                )
+                if available > 0:
+                    sell_qty = available
+                    break
+            except Exception as e:
                 print(
-                    f"[{pos.symbol}] WARN: available={sell_qty:.8f} << "
-                    f"pos.qty={pos.qty:.8f} — duży dust, sprawdź fees",
+                    f"[{pos.symbol}] balance fetch attempt {attempt+1}/3: {e}",
                     flush=True,
                 )
-        except Exception as e:
-            print(f"[{pos.symbol}] balance fetch failed, using pos.qty: {e}", flush=True)
+                await asyncio.sleep(0.5)
+
+        if sell_qty <= 0:
+            raise ValueError(
+                f"zero_available_balance for {base_currency} "
+                f"after 3 attempts"
+            )
+
+        # Sprawdź minimalną wartość zlecenia (~1 USDT)
+        cached = self._cache.get_top_of_book(pos.symbol) if self._cache else None
+        if cached:
+            mid_price = (cached[0] + cached[1]) / 2.0
+            notional = sell_qty * mid_price
+            if notional < 1.0:
+                raise ValueError(
+                    f"dust_below_min_order: {sell_qty:.8f} {base_currency} "
+                    f"≈ {notional:.4f} USDT"
+                )
+
+        if sell_qty < pos.qty * 0.90:
+            print(
+                f"[{pos.symbol}] WARN: selling {sell_qty:.8f} "
+                f"vs pos.qty={pos.qty:.8f} "
+                f"(diff={(pos.qty - sell_qty):.8f} — fee dust)",
+                flush=True,
+            )
 
         last_exc: Exception = Exception("no_attempts")
         for attempt in range(3):
@@ -657,7 +668,8 @@ class ExecutionEngine:
                 if attempt > 0:
                     await asyncio.sleep(0.5 * attempt)
                 o = await self._call(
-                    self.exchange.create_order, ccxt_sym, "market", side, sell_qty
+                    self.exchange.create_order,
+                    ccxt_sym, "market", side, sell_qty
                 )
                 order_id = o.get("id")
                 if order_id:
@@ -665,24 +677,67 @@ class ExecutionEngine:
                     o = await self._call(
                         self.exchange.fetch_order, order_id, ccxt_sym
                     ) or o
-                filled = float(o.get("average") or o.get("price") or 0.0)
+                filled = float(
+                    o.get("average") or o.get("price") or 0.0
+                )
                 if filled <= 0:
                     raise ValueError(f"zero_fill attempt={attempt}")
+
+                # Sprawdź czy pozostał dust — jeśli tak, spróbuj sprzedać resztę
+                try:
+                    loop = asyncio.get_running_loop()
+                    bal_after = await loop.run_in_executor(
+                        None, lambda: self.exchange.fetch_balance()
+                    )
+                    remaining = float(
+                        (bal_after.get(base_currency) or {}).get("free") or 0.0
+                    )
+                    if remaining > 0:
+                        cached = self._cache.get_top_of_book(pos.symbol) \
+                            if self._cache else None
+                        if cached:
+                            dust_notional = remaining * (
+                                (cached[0] + cached[1]) / 2.0
+                            )
+                            if dust_notional >= 1.0:
+                                # Dust jest handlowalny — sprzedaj
+                                print(
+                                    f"[{pos.symbol}] Sprzedaję pozostały dust: "
+                                    f"{remaining:.8f} {base_currency} "
+                                    f"≈ {dust_notional:.4f} USDT",
+                                    flush=True,
+                                )
+                                await self._call(
+                                    self.exchange.create_order,
+                                    ccxt_sym, "market", side, remaining
+                                )
+                except Exception as dust_err:
+                    print(
+                        f"[{pos.symbol}] dust cleanup error (non-fatal): "
+                        f"{dust_err}",
+                        flush=True,
+                    )
+
                 return {
                     "price": filled,
-                    "fee_cost": float((o.get("fee") or {}).get("cost") or 0.0),
-                    "fee_currency": (o.get("fee") or {}).get("currency") or "USDT",
+                    "fee_cost": float(
+                        (o.get("fee") or {}).get("cost") or 0.0
+                    ),
+                    "fee_currency": (
+                        (o.get("fee") or {}).get("currency") or "USDT"
+                    ),
                 }
             except Exception as e:
                 last_exc = e
                 print(
                     f"[ORDER] _market_sell FAILED attempt={attempt+1}/3 "
-                    f"{ccxt_sym} qty={sell_qty:.6f}: {e}",
+                    f"{ccxt_sym} qty={sell_qty:.8f}: {e}",
                     flush=True,
                 )
+
         raise RuntimeError(
             f"_market_sell: 3 retries exhausted for {ccxt_sym} "
-            f"qty={sell_qty:.6f}: {last_exc}"
+            f"qty={sell_qty:.8f}: {last_exc}"
         )
 
     def _get_cached_price(self, symbol: str, fallback: float) -> float:
