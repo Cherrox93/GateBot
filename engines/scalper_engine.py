@@ -2738,6 +2738,17 @@ class ScalperEngine:
             self.log(f"[{signal.symbol}] ML TP/SL adjust: TP x{adj.tp_adjustment:.2f}, "
                      f"SL x{adj.sl_adjustment:.2f}")
 
+        # Log BUY natychmiast — zanim execute_signal zablokuje
+        _buy_msg = (
+            f"💰 BUY {signal.symbol.replace('_', '/')} | "
+            f"Entry Price: {signal.entry_price} | "
+            f"Stawka: {stake:.2f}$"
+        )
+        self.set_status(f"🚀 BUY {signal.symbol.replace('_', '/')}")
+        self.gui_log(_buy_msg)
+        self.log(_buy_msg)
+        await self._tg(_buy_msg)
+
         try:
             result = await self._executor.execute_signal(signal, stake)
         except Exception as exc:
@@ -2763,19 +2774,6 @@ class ScalperEngine:
             self._pending_orders.discard(signal.symbol)
             self._last_trade_ts[signal.symbol] = time.time()
             return
-
-        # Loguj BUY z RZECZYWISTYMI wartościami po wypełnieniu
-        _real_entry = result.entry_price
-        _real_stake = result.stake
-        ccxt_sym = signal.symbol.replace("_", "/")
-        buy_msg = (
-            f"💰 BUY {ccxt_sym} | Entry Price: {_real_entry} | "
-            f"Stawka: {_real_stake:.2f}$"
-        )
-        self.set_status(f"🚀 BUY {ccxt_sym}")
-        self.gui_log(buy_msg)
-        self.log(buy_msg)
-        await self._tg(buy_msg)
 
         self._state.trades_today += 1
 
