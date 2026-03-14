@@ -1462,10 +1462,14 @@ class ScalperEngine:
 
             # Equity diff jako secondary check
             equity_diff = equity - self._start_equity
-            if abs(equity_diff - session_pnl) > 5.0:
+            # Loguj mismatch tylko gdy są zamknięte trady
+            # Bez tradów equity_diff to tylko zmiana rynkowa — nie błąd
+            _closed_trades = wins + losses
+            if _closed_trades > 0 and abs(equity_diff - session_pnl) > 5.0:
                 print(
                     f"[STATS] WARN: session_pnl mismatch "
-                    f"matched={session_pnl:.2f} equity_diff={equity_diff:.2f}",
+                    f"matched={session_pnl:.2f} equity_diff={equity_diff:.2f} "
+                    f"closed_trades={_closed_trades}",
                     flush=True,
                 )
 
