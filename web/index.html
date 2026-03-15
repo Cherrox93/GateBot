@@ -880,7 +880,7 @@
 // ═══════════════════════════════
 //   STATE
 // ═══════════════════════════════
-let TOKEN = localStorage.getItem('gatebot_token') || '';
+let TOKEN = '';
 let ws = null;
 const charts = {};
 const pnlData = { scalper: [], lowcap: [], grid_bot: [] };
@@ -897,9 +897,7 @@ setInterval(() => {
 // ═══════════════════════════════
 //   LOGIN
 // ═══════════════════════════════
-window.addEventListener('load', () => {
-  if (TOKEN) tryAutoLogin();
-});
+// No auto-login — always show login screen
 document.getElementById('login-pass').addEventListener('keydown', e => {
   if (e.key === 'Enter') doLogin();
 });
@@ -908,7 +906,7 @@ async function tryAutoLogin() {
   try {
     const r = await apiFetch('/api/state');
     if (r) showApp();
-  } catch { TOKEN = ''; localStorage.removeItem('gatebot_token'); }
+  } catch { TOKEN = ''; TOKEN = ''; }
 }
 
 async function doLogin() {
@@ -924,7 +922,7 @@ async function doLogin() {
     if (!r.ok) { document.getElementById('login-err').textContent = 'Nieprawidłowe dane'; return; }
     const data = await r.json();
     TOKEN = data.token;
-    localStorage.setItem('gatebot_token', TOKEN);
+    // Token only in memory — login required on every visit
     showApp();
   } catch {
     document.getElementById('login-err').textContent = 'Błąd połączenia z serwerem';
@@ -990,7 +988,7 @@ async function apiFetch(url, opts = {}) {
     headers: { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json', ...(opts.headers||{}) }
   });
   if (r.status === 401) {
-    if (TOKEN) { TOKEN = ''; localStorage.removeItem('gatebot_token'); location.reload(); }
+    if (TOKEN) { TOKEN = ''; TOKEN = ''; location.reload(); }
     return null;
   }
   return r.ok ? r.json() : null;
