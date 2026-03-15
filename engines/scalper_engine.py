@@ -1404,82 +1404,112 @@ class ScalperEngine:
                 except Exception:
                     pass
 
-            # 3) Compute stats from real data
-            buys = [t for t in all_trades if t.get("side") == "buy"]
-            sells = [t for t in all_trades if t.get("side") == "sell"]
+            # 3) Aggregate fills into orders
+            # Gate.io returns fills (partial executions), not orders.
+            # One market order can produce multiple fills.
+            # Group by order_id to get correct cost per order.
+            _orders: dict[str, dict] = {}
+            for t in all_trades:
+                oid = t.get("order") or t.get("id")
+                if oid not in _orders:
+                    _orders[oid] = {
+                        "order_id": oid,
+                        "symbol": t.get("symbol"),
+                        "side": t.get("side"),
+                        "cost": 0.0,
+                        "fee": 0.0,
+                        "timestamp": _safe_float(t.get("timestamp")),
+                        "price": _safe_float(t.get("price")),
+                        "amount": 0.0,
+                    }
+                _orders[oid]["cost"] += _safe_float(t.get("cost"))
+                _orders[oid]["fee"] += _safe_float((t.get("fee") or {}).get("cost"))
+                _orders[oid]["amount"] += _safe_float(t.get("amount"))
+                # Keep latest timestamp and weighted avg price
+                ts = _safe_float(t.get("timestamp"))
+                if ts > _orders[oid]["timestamp"]:
+                    _orders[oid]["timestamp"] = ts
 
-            # Only count matched pairs — an unmatched BUY is an open position, not a loss.
+            order_list = list(_orders.values())
+            buys = [o for o in order_list if o.get("side") == "buy"]
+            sells = [o for o in order_list if o.get("side") == "sell"]
+
+            # Match sell orders to buy orders (1:1 by order)
             matched_buy_ids: set[str] = set()
             matched_pnl: float = 0.0
             matched_fee: float = 0.0
             for sell in sells:
                 sym = sell.get("symbol")
-                sell_ts = _safe_float(sell.get("timestamp"))
+                sell_ts = sell["timestamp"]
                 candidates = [
                     b for b in buys
                     if b.get("symbol") == sym
-                    and _safe_float(b.get("timestamp")) < sell_ts
-                    and b.get("id") not in matched_buy_ids
+                    and b["timestamp"] < sell_ts
+                    and b["order_id"] not in matched_buy_ids
                 ]
                 if not candidates:
                     continue
-                matching_buy = max(candidates, key=lambda b: _safe_float(b.get("timestamp")))
-                matched_buy_ids.add(matching_buy.get("id"))
-                sell_cost = _safe_float(sell.get("cost"))
-                buy_cost  = _safe_float(matching_buy.get("cost"))
-                sell_fee  = _safe_float((sell.get("fee") or {}).get("cost"))
-                buy_fee   = _safe_float((matching_buy.get("fee") or {}).get("cost"))
-                matched_pnl += sell_cost - buy_cost
-                matched_fee += sell_fee + buy_fee
+                matching_buy = max(candidates, key=lambda b: b["timestamp"])
+                matched_buy_ids.add(matching_buy["order_id"])
+                matched_pnl += sell["cost"] - matching_buy["cost"]
+                matched_fee += sell["fee"] + matching_buy["fee"]
 
             total_fee = matched_fee
             session_pnl = matched_pnl - matched_fee
 
-            # Daily PnL (trades from today only)
+            print(
+                f"[STATS] fills={len(all_trades)} orders={len(order_list)} "
+                f"buys={len(buys)} sells={len(sells)} "
+                f"matched={len(matched_buy_ids)} "
+                f"matched_pnl={matched_pnl:.4f} fee={matched_fee:.4f} "
+                f"session_pnl={session_pnl:.4f}",
+                flush=True,
+            )
+
+            # Daily PnL — use aggregated orders, filter by today
             today_start = datetime.now().replace(
                 hour=0, minute=0, second=0, microsecond=0
             ).timestamp() * 1000
-            today_trades = [
-                t for t in all_trades
-                if _safe_float(t.get("timestamp")) >= today_start
-            ]
-            today_buys = [t for t in today_trades if t.get("side") == "buy"]
-            today_sells = [t for t in today_trades if t.get("side") == "sell"]
+            today_buys = [o for o in buys if o["timestamp"] >= today_start]
+            today_sells = [o for o in sells if o["timestamp"] >= today_start]
             today_matched_buy_ids: set[str] = set()
             daily_pnl: float = 0.0
             today_fee: float = 0.0
             for sell in today_sells:
                 sym = sell.get("symbol")
-                sell_ts = _safe_float(sell.get("timestamp"))
+                sell_ts = sell["timestamp"]
                 candidates = [
                     b for b in today_buys
                     if b.get("symbol") == sym
-                    and _safe_float(b.get("timestamp")) < sell_ts
-                    and b.get("id") not in today_matched_buy_ids
+                    and b["timestamp"] < sell_ts
+                    and b["order_id"] not in today_matched_buy_ids
                 ]
                 if not candidates:
                     continue
-                matching_buy = max(candidates, key=lambda b: _safe_float(b.get("timestamp")))
-                today_matched_buy_ids.add(matching_buy.get("id"))
-                sell_fee = _safe_float((sell.get("fee") or {}).get("cost"))
-                buy_fee  = _safe_float((matching_buy.get("fee") or {}).get("cost"))
-                daily_pnl += _safe_float(sell.get("cost")) - _safe_float(matching_buy.get("cost"))
-                today_fee += sell_fee + buy_fee
+                matching_buy = max(candidates, key=lambda b: b["timestamp"])
+                today_matched_buy_ids.add(matching_buy["order_id"])
+                daily_pnl += sell["cost"] - matching_buy["cost"]
+                today_fee += sell["fee"] + matching_buy["fee"]
             daily_pnl -= today_fee
 
-            # Wins/losses: compare sell price vs last buy of same symbol
+            # Wins/losses — use aggregated orders
             wins = 0
             losses = 0
+            _wl_matched: set[str] = set()
             for sell in sells:
                 sym = sell.get("symbol")
-                matching_buys = [
+                candidates = [
                     b for b in buys
                     if b.get("symbol") == sym
-                    and _safe_float(b.get("timestamp")) < _safe_float(sell.get("timestamp"))
+                    and b["timestamp"] < sell["timestamp"]
+                    and b["order_id"] not in _wl_matched
                 ]
-                if matching_buys:
-                    last_buy = max(matching_buys, key=lambda b: _safe_float(b.get("timestamp")))
-                    if _safe_float(sell.get("price")) > _safe_float(last_buy.get("price")):
+                if candidates:
+                    matching_buy = max(candidates, key=lambda b: b["timestamp"])
+                    _wl_matched.add(matching_buy["order_id"])
+                    # Win if sell revenue > buy cost (after fees)
+                    net = (sell["cost"] - sell["fee"]) - (matching_buy["cost"] + matching_buy["fee"])
+                    if net >= 0:
                         wins += 1
                     else:
                         losses += 1
@@ -2449,9 +2479,12 @@ class ScalperEngine:
             if sym in self._symbols:
                 self._cache.update_orderbook(sym, result)
         elif channel == "spot.trades" and event == "update":
-            sym = result.get("currency_pair")
-            if sym in self._symbols:
-                self._cache.update_trades(sym, [result])
+            # Gate.io V4 sends result as array of trades OR single dict
+            trade_list = result if isinstance(result, list) else [result]
+            for trade in trade_list:
+                sym = trade.get("currency_pair")
+                if sym and sym in self._symbols:
+                    self._cache.update_trades(sym, [trade])
 
     # ── Processing loop ──────────────────────────────────────────────────────
 

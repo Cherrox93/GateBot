@@ -47,8 +47,8 @@ from wallet import SharedWallet
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 WEB_USERNAME = os.environ.get("WEB_USERNAME", "admin")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "gatebot2024")
-JWT_SECRET   = os.environ.get("JWT_SECRET", "superSecretKey_zmienMnie!")
-JWT_EXPIRE_H = 24 * 7  # token wazny 7 dni
+JWT_SECRET   = os.environ.get("JWT_SECRET", "gBt_s3cr3t_k3y_2026!xQ9")
+JWT_EXPIRE_H = 12  # token wazny 12 godzin
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
