@@ -1316,6 +1316,19 @@ class ScalperEngine:
             equity = usdt_free + assets_value
             engaged = assets_value
 
+            # Debug — log first call to verify
+            if not hasattr(self, '_equity_debug_count'):
+                self._equity_debug_count = 0
+            self._equity_debug_count += 1
+            if self._equity_debug_count <= 3:
+                print(
+                    f"[EQUITY_DEBUG] usdt_free={usdt_free:.2f} "
+                    f"assets_value={assets_value:.2f} "
+                    f"equity={equity:.2f} "
+                    f"symbols_checked={len(self._symbols)}",
+                    flush=True,
+                )
+
             return {
                 "usdt_free": round(usdt_free, 2),
                 "equity": round(equity, 2),
@@ -2140,6 +2153,92 @@ class ScalperEngine:
         except Exception:
             pass
 
+    async def _handle_recovered_exit(
+        self, pos: OpenPosition, ccxt_sym: str, stake: float,
+    ) -> None:
+        """Monitor a recovered position and process exit like _execute_and_record."""
+        try:
+            result = await self._executor._monitor(pos, ccxt_sym, fill_latency_sec=0.0)
+        except Exception as exc:
+            self.log(f"[RECOVERY] {pos.symbol} monitor error: {exc}")
+            self._state.remove(pos.symbol)
+            self._clear_position_file(pos.symbol)
+            return
+
+        self._state.remove(pos.symbol)
+        self._clear_position_file(pos.symbol)
+        self._broadcast_position_closed(pos.symbol)
+
+        if result.exit_reason == "MISSED":
+            return
+
+        net_pnl = round(result.pnl_usd - result.fee_paid, 2)
+
+        # Update W/L counters
+        if net_pnl >= 0:
+            self._session_wins += 1
+        else:
+            self._session_losses += 1
+
+        _total = self._session_wins + self._session_losses
+        _wr = round(self._session_wins / _total * 100, 1) if _total > 0 else 0.0
+
+        _current_session_pnl = self._stats_cache.get("session_pnl", 0.0) + net_pnl
+        self._stats_cache.update({
+            "wins": self._session_wins,
+            "losses": self._session_losses,
+            "win_rate": _wr,
+            "session_pnl": round(_current_session_pnl, 2),
+        })
+
+        self._invalidate_balance_cache()
+        self._stats_cache_ts = 0.0
+
+        # Circuit breaker
+        if net_pnl < 0:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= 3:
+                self._circuit_breaker_until = time.time() + 20 * 60
+                cb_msg = (
+                    f"🛑 CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses — "
+                    f"trading paused for 20 min"
+                )
+                self.log(cb_msg)
+                await self._tg(cb_msg)
+        else:
+            self._consecutive_losses = 0
+
+        # Analytics
+        _local_pnl = result.pnl_usd - result.fee_paid
+        self.analytics.on_exit(
+            trade_id=f"scalper_{pos.symbol}_{int(time.time()*1000)}",
+            exit_reason=result.exit_reason,
+            pnl=_local_pnl,
+            pnl_pct=_local_pnl / stake if stake > 0 else 0,
+            mfe=getattr(result, 'mfe', 0.0),
+            mae=getattr(result, 'mae', 0.0),
+            symbol=pos.symbol.replace("_", "/"),
+            entry_price=result.entry_price,
+            stake=stake,
+            hold_seconds=result.duration,
+        )
+
+        # Log SELL
+        wr_text = self._wr_text()
+        emoji = "🚀" if result.exit_reason == "RUNNER" else "🔴"
+        sell_msg = (
+            f"{emoji} SELL {pos.symbol.replace('_', '/')} | "
+            f"{result.exit_reason} | Entry: {result.entry_price} | "
+            f"Sell: {result.exit_price} | PnL: {net_pnl:+.2f}$ | "
+            f"Dur: {result.duration:.1f}s | {wr_text}"
+        )
+        self.set_status(f"{'✅' if net_pnl >= 0 else '❌'} {pos.symbol.replace('_', '/')}")
+        self.gui_log(sell_msg)
+        self.log(sell_msg)
+        await self._tg(sell_msg)
+        self._pending_orders.discard(pos.symbol)
+        self._last_trade_ts[pos.symbol] = time.time()
+
     async def _recover_open_positions(self) -> None:
         """
         Odczytuje zapisane pliki pozycji z dysku i wznawia monitoring.
@@ -2246,8 +2345,9 @@ class ScalperEngine:
             self.log(msg)
             await self._tg(msg)
 
+            # Wrap _monitor in handler that processes exit result
             asyncio.create_task(
-                self._executor._monitor(pos, ccxt_sym, fill_latency_sec=0.0)
+                self._handle_recovered_exit(pos, ccxt_sym, stake)
             )
 
         if recovered == 0:

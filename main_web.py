@@ -738,11 +738,14 @@ async def get_portfolio(user=Depends(verify_token)):
             stats = await scalper_engine._fetch_trade_stats()
         except Exception:
             stats = scalper_engine.bot_profit_summary
+        _start = scalper_engine._start_equity
+        if _start <= 0:
+            _start = stats.get("equity", 0.0)
         return {
             "balance_usdt":   stats.get("usdt_free", 0.0),
             "total_exposure": stats.get("engaged", 0.0),
             "total_equity":   stats.get("equity", 0.0),
-            "start_balance":  round(scalper_engine._start_equity, 2),
+            "start_balance":  round(_start, 2),
         }
     else:
         available = wallet.get_total("USDT")
