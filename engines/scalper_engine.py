@@ -841,6 +841,16 @@ class ExecutionEngine:
             return self._missed(signal, stake, "qty_zero")
         print(f"[ORDER] Attempting {signal.symbol} {side} qty={qty} "
               f"stake={stake} price={signal.entry_price}", flush=True)
+
+        # Last-line-of-defense: verify real balance on Gate.io before BUY
+        if side == "buy":
+            self._invalidate_balance_cache()
+            real_free = await self._get_available_balance()
+            if real_free < stake * 0.95:
+                print(f"[ORDER] REJECTED {signal.symbol}: insufficient balance "
+                      f"real_free={real_free:.2f} < stake={stake:.2f}", flush=True)
+                return self._missed(signal, stake, "insufficient_balance")
+
         entry_start = time.time()
 
         # 1) Maker slightly inside spread (retail-safe, still post-only)
@@ -2172,6 +2182,10 @@ class ScalperEngine:
         if result.exit_reason == "MISSED":
             return
 
+        # Cooldown po sprzedaży — Gate.io potrzebuje czas na rozliczenie
+        self._invalidate_balance_cache()
+        await asyncio.sleep(3.0)
+
         net_pnl = round(result.pnl_usd - result.fee_paid, 2)
 
         # Update W/L counters
@@ -2990,6 +3004,10 @@ class ScalperEngine:
             self._pending_orders.discard(signal.symbol)
             self._last_trade_ts[signal.symbol] = time.time()
             return
+
+        # Cooldown po sprzedaży — Gate.io potrzebuje czas na rozliczenie
+        self._invalidate_balance_cache()
+        await asyncio.sleep(3.0)
 
         self._state.trades_today += 1
 
