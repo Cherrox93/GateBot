@@ -842,15 +842,6 @@ class ExecutionEngine:
         print(f"[ORDER] Attempting {signal.symbol} {side} qty={qty} "
               f"stake={stake} price={signal.entry_price}", flush=True)
 
-        # Last-line-of-defense: verify real balance on Gate.io before BUY
-        if side == "buy":
-            self._invalidate_balance_cache()
-            real_free = await self._get_available_balance()
-            if real_free < stake * 0.95:
-                print(f"[ORDER] REJECTED {signal.symbol}: insufficient balance "
-                      f"real_free={real_free:.2f} < stake={stake:.2f}", flush=True)
-                return self._missed(signal, stake, "insufficient_balance")
-
         entry_start = time.time()
 
         # 1) Maker slightly inside spread (retail-safe, still post-only)
@@ -2967,6 +2958,18 @@ class ScalperEngine:
             signal.sl_price = signal.entry_price * (1 - signal.direction * signal.sl_pct)
             self.log(f"[{signal.symbol}] ML TP/SL adjust: TP x{adj.tp_adjustment:.2f}, "
                      f"SL x{adj.sl_adjustment:.2f}")
+
+        # Last-line-of-defense: verify real balance before BUY
+        self._invalidate_balance_cache()
+        real_free = await self._get_available_balance()
+        if real_free < stake * 0.95:
+            self.log(f"[{signal.symbol}] REJECTED: insufficient balance "
+                     f"real_free={real_free:.2f} < stake={stake:.2f}")
+            self._state.remove(signal.symbol)
+            self._clear_position_file(signal.symbol)
+            self._pending_orders.discard(signal.symbol)
+            self._retry_after[signal.symbol] = time.time() + MISSED_RETRY_COOLDOWN_SEC
+            return
 
         # Log BUY natychmiast — zanim execute_signal zablokuje
         _buy_msg = (
