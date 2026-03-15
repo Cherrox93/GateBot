@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
         await market_data.start()
     apply_settings_to_engines(load_all_settings())
     print(f"[GateBot] Dashboard dostepny na http://0.0.0.0:8000", flush=True)
-    print(f"[GateBot] Login: {WEB_USERNAME} / {WEB_PASSWORD}", flush=True)
+    print(f"[GateBot] Login: {WEB_USERNAME} / {'*' * len(WEB_PASSWORD)}", flush=True)
     yield
     print("[GateBot] Zatrzymywanie botow...", flush=True)
     if scalper_state.running and scalper_engine:

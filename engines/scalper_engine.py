@@ -2478,13 +2478,27 @@ class ScalperEngine:
             sym = result.get("s")
             if sym in self._symbols:
                 self._cache.update_orderbook(sym, result)
-        elif channel == "spot.trades" and event == "update":
+        elif channel == "spot.trades":
             # Gate.io V4 sends result as array of trades OR single dict
             trade_list = result if isinstance(result, list) else [result]
+            _processed = 0
             for trade in trade_list:
                 sym = trade.get("currency_pair")
                 if sym and sym in self._symbols:
                     self._cache.update_trades(sym, [trade])
+                    _processed += 1
+            # Debug — log first few trade dispatches to verify format
+            if not hasattr(self, '_trade_dispatch_count'):
+                self._trade_dispatch_count = 0
+            self._trade_dispatch_count += 1
+            if self._trade_dispatch_count <= 5:
+                print(
+                    f"[WS_DEBUG] trades event={event} "
+                    f"result_type={type(result).__name__} "
+                    f"len={len(trade_list)} processed={_processed} "
+                    f"sample={str(result)[:200]}",
+                    flush=True,
+                )
 
     # ── Processing loop ──────────────────────────────────────────────────────
 
