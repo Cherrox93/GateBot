@@ -1258,8 +1258,13 @@ class ScalperEngine:
         self._accepting_signals: bool = True
         self._session_wins: int = 0
         self._session_losses: int = 0
+        self._session_pnl: float = 0.0
         self._consecutive_losses: int = 0
         self._circuit_breaker_until: float = 0.0
+        self._btc_h1_regime: int = 0
+        self._btc_h1_regime_ts: float = 0.0
+        self._symbol_sl_streak: dict[str, int] = {}
+        self._symbol_banned_until: dict[str, float] = {}
         self._exec_attempts = 0
         self._exec_fills = 0
         self._exec_missed = 0
@@ -1531,22 +1536,8 @@ class ScalperEngine:
             total_trades = wins + losses
             win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
 
-            # Session PnL = suma zamkniętych tradów w tej sesji
-            # NIE używamy equity diff — balance_cache może być stale
-            session_pnl = matched_pnl - matched_fee
-
-            # Equity diff jako secondary check
-            equity_diff = equity - self._start_equity
-            # Loguj mismatch tylko gdy są zamknięte trady
-            # Bez tradów equity_diff to tylko zmiana rynkowa — nie błąd
-            _closed_trades = wins + losses
-            if _closed_trades > 0 and abs(equity_diff - session_pnl) > 5.0:
-                print(
-                    f"[STATS] WARN: session_pnl mismatch "
-                    f"matched={session_pnl:.2f} equity_diff={equity_diff:.2f} "
-                    f"closed_trades={_closed_trades}",
-                    flush=True,
-                )
+            # Session PnL = wewnętrzny akumulator (nie Gate.io matching)
+            session_pnl = self._session_pnl
 
             stats = {
                 "bot": "scalper",
@@ -1776,6 +1767,55 @@ class ScalperEngine:
         if price < ema20 < ema50:
             return -1
         return 0
+
+    async def _get_btc_h1_regime(self) -> int:
+        """
+        Fetch BTC/USDT H1 OHLCV via REST and determine regime.
+        Cached for 5 minutes to avoid API spam.
+        Returns: 1 (bullish), -1 (bearish), 0 (unknown/neutral)
+        """
+        now = time.time()
+        if now - self._btc_h1_regime_ts < 300.0:
+            return self._btc_h1_regime
+
+        try:
+            loop = asyncio.get_running_loop()
+            ohlcv = await loop.run_in_executor(
+                None,
+                lambda: self.exchange_client.fetch_ohlcv(
+                    "BTC/USDT", "1h", limit=4
+                )
+            )
+            if not ohlcv or len(ohlcv) < 3:
+                self._btc_h1_regime = 0
+                self._btc_h1_regime_ts = now
+                return 0
+
+            closes = [c[4] for c in ohlcv]
+            c_prev2 = closes[-3]
+            c_prev1 = closes[-2]
+            c_now   = closes[-1]
+
+            if c_prev1 > c_prev2 and c_now > c_prev1:
+                regime = 1
+            elif c_prev1 < c_prev2 and c_now < c_prev1:
+                regime = -1
+            else:
+                regime = 0
+
+            self._btc_h1_regime = regime
+            self._btc_h1_regime_ts = now
+            print(
+                f"[BTC_H1] regime={regime} "
+                f"c_prev2={c_prev2:.1f} c_prev1={c_prev1:.1f} c_now={c_now:.1f}",
+                flush=True,
+            )
+            return regime
+
+        except Exception as e:
+            print(f"[BTC_H1] fetch error (non-fatal): {e}", flush=True)
+            self._btc_h1_regime_ts = now - 240.0
+            return self._btc_h1_regime
 
     def _detect_impulse(self, symbol: str) -> Optional[dict]:
         momentum_window = float(self.cfg.momentum_window_sec)
@@ -2122,6 +2162,7 @@ class ScalperEngine:
         self._circuit_breaker_until = 0.0
         self._session_wins = 0
         self._session_losses = 0
+        self._session_pnl = 0.0
         self._stats_cache = {}
         self._stats_cache_ts = 0.0
 
@@ -2188,30 +2229,45 @@ class ScalperEngine:
         _total = self._session_wins + self._session_losses
         _wr = round(self._session_wins / _total * 100, 1) if _total > 0 else 0.0
 
-        _current_session_pnl = self._stats_cache.get("session_pnl", 0.0) + net_pnl
+        self._session_pnl += net_pnl
         self._stats_cache.update({
             "wins": self._session_wins,
             "losses": self._session_losses,
             "win_rate": _wr,
-            "session_pnl": round(_current_session_pnl, 2),
+            "session_pnl": round(self._session_pnl, 2),
         })
 
         self._invalidate_balance_cache()
         self._stats_cache_ts = 0.0
 
-        # Circuit breaker
+        # Circuit breaker + per-symbol ban
         if net_pnl < 0:
             self._consecutive_losses += 1
+
+            sym_streak = self._symbol_sl_streak.get(pos.symbol, 0) + 1
+            self._symbol_sl_streak[pos.symbol] = sym_streak
+            if sym_streak >= 2:
+                ban_hours = sym_streak - 1
+                ban_sec = min(ban_hours * 3600.0, 8 * 3600.0)
+                self._symbol_banned_until[pos.symbol] = time.time() + ban_sec
+                self.log(
+                    f"⛔ {pos.symbol.replace('_', '/')} zablokowany "
+                    f"na {ban_hours}h ({sym_streak} SL z rzędu)"
+                )
+
             if self._consecutive_losses >= 3:
-                self._circuit_breaker_until = time.time() + 20 * 60
+                pause_min = min(20 * (self._consecutive_losses - 2), 120)
+                self._circuit_breaker_until = time.time() + pause_min * 60
                 cb_msg = (
                     f"🛑 CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses — "
-                    f"trading paused for 20 min"
+                    f"trading paused for {pause_min} min"
                 )
                 self.log(cb_msg)
                 await self._tg(cb_msg)
         else:
             self._consecutive_losses = 0
+            self._symbol_sl_streak[pos.symbol] = 0
+            self._symbol_banned_until.pop(pos.symbol, None)
 
         # Analytics
         _local_pnl = result.pnl_usd - result.fee_paid
@@ -2628,6 +2684,10 @@ class ScalperEngine:
         if self._state.count() >= max_pos:
             return
 
+        # Symbol ban: skip symbols with consecutive SL losses
+        if time.time() < self._symbol_banned_until.get(symbol, 0.0):
+            return
+
         if not self._warmup_ready():
             return
         if time.time() - self._last_ws_ok > EXCHANGE_TIMEOUT_SEC:
@@ -2657,6 +2717,13 @@ class ScalperEngine:
         signals: list[Signal] = []
         features = self._features.compute(snapshot)
         trend_dir = self._trend_direction(symbol)
+
+        # BTC H1 regime filter — skip all long entries during confirmed H1 downtrend
+        btc_h1 = await self._get_btc_h1_regime()
+        if btc_h1 == -1:
+            if _dbg_throttle:
+                print(f"[DEBUG {symbol}] SKIP: btc_h1_bearish", flush=True)
+            return
 
         momentum_window = float(self.cfg.momentum_window_sec)
         vol_window = float(self.cfg.volume_baseline_window_sec)
@@ -3033,23 +3100,37 @@ class ScalperEngine:
         _total = self._session_wins + self._session_losses
         _wr = round(self._session_wins / _total * 100, 1) if _total > 0 else 0.0
 
-        # Zaktualizuj tylko W/L/WR/session_pnl w cache — reszta odświeży się async
-        _current_session_pnl = self._stats_cache.get("session_pnl", 0.0) + net_pnl
+        # Zaktualizuj session_pnl w wewnętrznym akumulatorze (nie z Gate.io API)
+        self._session_pnl += net_pnl
         self._stats_cache.update({
             "wins": self._session_wins,
             "losses": self._session_losses,
             "win_rate": _wr,
-            "session_pnl": round(_current_session_pnl, 2),
+            "session_pnl": round(self._session_pnl, 2),
         })
 
         self._invalidate_balance_cache()  # force fresh balance on next check
         self._stats_cache_ts = 0.0        # invalidate stats cache — force refresh
 
-        # ── Circuit breaker: 3 consecutive SL losses → 20 min pause ──
+        # ── Circuit breaker + per-symbol ban ──
         if net_pnl < 0:
             self._consecutive_losses += 1
+
+            # Per-symbol SL streak tracking
+            sym_streak = self._symbol_sl_streak.get(signal.symbol, 0) + 1
+            self._symbol_sl_streak[signal.symbol] = sym_streak
+            if sym_streak >= 2:
+                ban_hours = sym_streak - 1
+                ban_sec = min(ban_hours * 3600.0, 8 * 3600.0)
+                self._symbol_banned_until[signal.symbol] = time.time() + ban_sec
+                self.log(
+                    f"⛔ {signal.symbol.replace('_', '/')} zablokowany "
+                    f"na {ban_hours}h ({sym_streak} SL z rzędu)"
+                )
+
+            # Adaptive circuit breaker: longer pause for longer losing streaks
             if self._consecutive_losses >= 3:
-                pause_min = 20
+                pause_min = min(20 * (self._consecutive_losses - 2), 120)
                 self._circuit_breaker_until = time.time() + pause_min * 60
                 cb_msg = (
                     f"🛑 CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses — "
@@ -3060,6 +3141,8 @@ class ScalperEngine:
                 await self._tg(cb_msg)
         else:
             self._consecutive_losses = 0
+            self._symbol_sl_streak[signal.symbol] = 0
+            self._symbol_banned_until.pop(signal.symbol, None)
 
         # ── Analytics exit (with MFE/MAE) — uses local calculation, not exchange ──
         _local_pnl = result.pnl_usd - result.fee_paid
