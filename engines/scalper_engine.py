@@ -1407,137 +1407,12 @@ class ScalperEngine:
             equity = real["equity"]
             positions_value = real["engaged"]
 
-            # 2) Trade history from exchange (since session start)
-            since_ms = int(self._session_start_time * 1000)
-            all_trades = []
-            for symbol in self._symbols:
-                try:
-                    ccxt_sym = symbol.replace("_", "/")
-                    trades = await loop.run_in_executor(
-                        None,
-                        lambda s=ccxt_sym: self.exchange_client.fetch_my_trades(
-                            s, since=since_ms, limit=100
-                        )
-                    )
-                    all_trades.extend(trades)
-                except Exception:
-                    pass
-
-            # 3) Aggregate fills into orders
-            # Gate.io returns fills (partial executions), not orders.
-            # One market order can produce multiple fills.
-            # Group by order_id to get correct cost per order.
-            _orders: dict[str, dict] = {}
-            for t in all_trades:
-                oid = t.get("order") or t.get("id")
-                if oid not in _orders:
-                    _orders[oid] = {
-                        "order_id": oid,
-                        "symbol": t.get("symbol"),
-                        "side": t.get("side"),
-                        "cost": 0.0,
-                        "fee": 0.0,
-                        "timestamp": _safe_float(t.get("timestamp")),
-                        "price": _safe_float(t.get("price")),
-                        "amount": 0.0,
-                    }
-                _orders[oid]["cost"] += _safe_float(t.get("cost"))
-                _orders[oid]["fee"] += _safe_float((t.get("fee") or {}).get("cost"))
-                _orders[oid]["amount"] += _safe_float(t.get("amount"))
-                # Keep latest timestamp and weighted avg price
-                ts = _safe_float(t.get("timestamp"))
-                if ts > _orders[oid]["timestamp"]:
-                    _orders[oid]["timestamp"] = ts
-
-            order_list = list(_orders.values())
-            buys = [o for o in order_list if o.get("side") == "buy"]
-            sells = [o for o in order_list if o.get("side") == "sell"]
-
-            # Match sell orders to buy orders (1:1 by order)
-            matched_buy_ids: set[str] = set()
-            matched_pnl: float = 0.0
-            matched_fee: float = 0.0
-            for sell in sells:
-                sym = sell.get("symbol")
-                sell_ts = sell["timestamp"]
-                candidates = [
-                    b for b in buys
-                    if b.get("symbol") == sym
-                    and b["timestamp"] < sell_ts
-                    and b["order_id"] not in matched_buy_ids
-                ]
-                if not candidates:
-                    continue
-                matching_buy = max(candidates, key=lambda b: b["timestamp"])
-                matched_buy_ids.add(matching_buy["order_id"])
-                matched_pnl += sell["cost"] - matching_buy["cost"]
-                matched_fee += sell["fee"] + matching_buy["fee"]
-
-            total_fee = matched_fee
-            session_pnl = matched_pnl - matched_fee
-
-            print(
-                f"[STATS] fills={len(all_trades)} orders={len(order_list)} "
-                f"buys={len(buys)} sells={len(sells)} "
-                f"matched={len(matched_buy_ids)} "
-                f"matched_pnl={matched_pnl:.4f} fee={matched_fee:.4f} "
-                f"session_pnl={session_pnl:.4f}",
-                flush=True,
-            )
-
-            # Daily PnL — use aggregated orders, filter by today
-            today_start = datetime.now().replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).timestamp() * 1000
-            today_buys = [o for o in buys if o["timestamp"] >= today_start]
-            today_sells = [o for o in sells if o["timestamp"] >= today_start]
-            today_matched_buy_ids: set[str] = set()
-            daily_pnl: float = 0.0
-            today_fee: float = 0.0
-            for sell in today_sells:
-                sym = sell.get("symbol")
-                sell_ts = sell["timestamp"]
-                candidates = [
-                    b for b in today_buys
-                    if b.get("symbol") == sym
-                    and b["timestamp"] < sell_ts
-                    and b["order_id"] not in today_matched_buy_ids
-                ]
-                if not candidates:
-                    continue
-                matching_buy = max(candidates, key=lambda b: b["timestamp"])
-                today_matched_buy_ids.add(matching_buy["order_id"])
-                daily_pnl += sell["cost"] - matching_buy["cost"]
-                today_fee += sell["fee"] + matching_buy["fee"]
-            daily_pnl -= today_fee
-
-            # Wins/losses — use aggregated orders
-            wins = 0
-            losses = 0
-            _wl_matched: set[str] = set()
-            for sell in sells:
-                sym = sell.get("symbol")
-                candidates = [
-                    b for b in buys
-                    if b.get("symbol") == sym
-                    and b["timestamp"] < sell["timestamp"]
-                    and b["order_id"] not in _wl_matched
-                ]
-                if candidates:
-                    matching_buy = max(candidates, key=lambda b: b["timestamp"])
-                    _wl_matched.add(matching_buy["order_id"])
-                    # Win if sell revenue > buy cost (after fees)
-                    net = (sell["cost"] - sell["fee"]) - (matching_buy["cost"] + matching_buy["fee"])
-                    if net >= 0:
-                        wins += 1
-                    else:
-                        losses += 1
-
-            total_trades = wins + losses
-            win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
-
-            # Session PnL = wewnętrzny akumulator (nie Gate.io matching)
+            # Session PnL, W/L — wewnętrzne akumulatory (nie Gate.io matching)
             session_pnl = self._session_pnl
+            total_trades = self._session_wins + self._session_losses
+            # Estimate fees from config (Gate.io API returns fee=0 when paid with GT/points)
+            fee_rate = float(self.cfg.taker_fee) + float(self.cfg.maker_fee)
+            estimated_fee = total_trades * float(self.cfg.max_stake_usd) * fee_rate
 
             stats = {
                 "bot": "scalper",
@@ -1545,12 +1420,12 @@ class ScalperEngine:
                 "equity": round(equity, 2),
                 "engaged": round(positions_value, 2),
                 "session_pnl": round(session_pnl, 2),
-                "daily_pnl": round(daily_pnl, 4),
-                "total_fee_paid": round(total_fee, 4),
+                "daily_pnl": round(session_pnl, 2),
+                "total_fee_paid": round(estimated_fee, 4),
                 "wins": self._session_wins,
                 "losses": self._session_losses,
-                "total_trades": self._session_wins + self._session_losses,
-                "win_rate": round(self._session_wins / (self._session_wins + self._session_losses) * 100, 1) if (self._session_wins + self._session_losses) > 0 else 0.0,
+                "total_trades": total_trades,
+                "win_rate": round(self._session_wins / total_trades * 100, 1) if total_trades > 0 else 0.0,
                 "effective_stake": self._calc_effective_stake(),
                 "open_positions": self._state.count(),
                 "last_updated": datetime.now().strftime("%H:%M:%S"),
@@ -1599,6 +1474,10 @@ class ScalperEngine:
             last_sell = max(sell_trades, key=lambda t: float(t.get("timestamp", 0)))
             real_sell_price = float(last_sell.get("price", 0.0))
             real_fee = float(last_sell.get("fee", {}).get("cost", 0.0))
+            # Gate.io returns fee=0 when paid with GT/points — estimate from config
+            if real_fee < 0.0001:
+                cost = real_sell_price * qty
+                real_fee = cost * (float(self.cfg.maker_fee) + float(self.cfg.taker_fee))
             real_pnl = (real_sell_price - entry_price) * qty - real_fee
             return round(real_pnl, 2)
 
@@ -2218,7 +2097,10 @@ class ScalperEngine:
         self._invalidate_balance_cache()
         await asyncio.sleep(3.0)
 
-        net_pnl = round(result.pnl_usd - result.fee_paid, 2)
+        _rec_fee = result.fee_paid
+        if _rec_fee < 0.0001:
+            _rec_fee = stake * (float(self.cfg.maker_fee) + float(self.cfg.taker_fee))
+        net_pnl = round(result.pnl_usd - _rec_fee, 2)
 
         # Update W/L counters
         if net_pnl >= 0:
@@ -3088,8 +2970,14 @@ class ScalperEngine:
             qty=result.stake / result.entry_price if result.entry_price > 0 else 0,
             after_ts=result.timestamp - result.duration,
         )
-        net_pnl = _real_pnl if _real_pnl is not None \
-            else round(result.pnl_usd - result.fee_paid, 2)
+        if _real_pnl is not None:
+            net_pnl = _real_pnl
+        else:
+            # Fallback: estimate fees if Gate.io returns 0 (GT/points payment)
+            _fallback_fee = result.fee_paid
+            if _fallback_fee < 0.0001:
+                _fallback_fee = result.stake * (float(self.cfg.maker_fee) + float(self.cfg.taker_fee))
+            net_pnl = round(result.pnl_usd - _fallback_fee, 2)
 
         # Natychmiastowa aktualizacja bez czekania na _fetch_trade_stats
         if net_pnl >= 0:
