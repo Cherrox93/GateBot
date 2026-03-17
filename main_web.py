@@ -812,8 +812,8 @@ async def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_to
             raise HTTPException(400, "stake_usd musi byc > 0")
         if req.max_slots < 1 or req.max_slots > 10:
             raise HTTPException(400, "max_slots musi byc w zakresie 1-10")
-        _live_bal = scalper_engine.balance_usdt if scalper_engine else wallet.start_balance
-        if req.stake_usd * req.max_slots > _live_bal:
+        _live_bal = scalper_engine._equity if (scalper_engine and scalper_engine._equity > 0) else wallet.start_balance
+        if req.stake_usd * req.max_slots > _live_bal * 1.05:
             raise HTTPException(
                 400,
                 f"Ekspozycja ({req.stake_usd * req.max_slots:.2f}$) przekracza balance ({_live_bal:.2f}$)",
