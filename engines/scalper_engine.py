@@ -1675,12 +1675,14 @@ class ScalperEngine:
             c_prev1 = closes[-2]
             c_now   = closes[-1]
 
-            if c_prev1 > c_prev2 and c_now > c_prev1:
-                regime = 1
-            elif c_prev1 < c_prev2 and c_now < c_prev1:
-                regime = -1
+            # Only block during strong downtrend (>0.5% drop across 2 closed H1 candles)
+            pct_change = (c_now - c_prev2) / c_prev2 if c_prev2 > 0 else 0.0
+            if pct_change > 0.003:
+                regime = 1    # clear uptrend
+            elif pct_change < -0.005:
+                regime = -1   # strong downtrend — block entries
             else:
-                regime = 0
+                regime = 0    # neutral / mild move — allow trading
 
             self._btc_h1_regime = regime
             self._btc_h1_regime_ts = now
@@ -2628,10 +2630,12 @@ class ScalperEngine:
             vol_last_5s = 0.0
             baseline_volume = 0.0
 
-        # Skip symbols with no trade flow data (stale WS or illiquid pair)
-        if baseline_volume == 0 and vol_last_5s == 0:
+        # Skip symbols with no price data at all (stale WS)
+        # ATR > 0 means price_ticks exist in 60s window — pair is active
+        price_ticks_60s = self._cache.get_price_ticks(symbol, 60.0)
+        if len(price_ticks_60s) < 2:
             if _dbg_throttle:
-                print(f"[DEBUG {symbol}] SKIP: no_trade_flow (WS stale or illiquid)", flush=True)
+                print(f"[DEBUG {symbol}] SKIP: no_trade_flow (WS stale)", flush=True)
             return
 
         trend_required = trend_dir == 1
@@ -2644,8 +2648,7 @@ class ScalperEngine:
         # 1) Momentum breakout with micro-pullback entry.
         if (
             price_change_5s > float(self.cfg.momentum_min_change)
-            and baseline_volume > 0
-            and vol_last_5s > 1.5 * baseline_volume
+            and (vol_last_5s > 0 or baseline_volume > 0)
             and trend_required
         ):
             impulse_detected_price = snapshot.last_price
