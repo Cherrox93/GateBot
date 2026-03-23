@@ -2584,10 +2584,10 @@ class ScalperEngine:
         snapshot = self._cache.get_snapshot(symbol)
         if snapshot is None:
             return
-        # Relaxed ATR filter: allow moderate volatility regimes.
+        # ATR filter: skip only completely dead pairs
         atr_1m_pct = self._cache.get_atr_1m_pct(symbol)
         _dbg_throttle = time.time() - self._debug_last_print.get(symbol, 0) > 10.0
-        if atr_1m_pct < float(self.cfg.atr_filter_min) * 0.4:
+        if atr_1m_pct < float(self.cfg.atr_filter_min) * 0.25:
             if _dbg_throttle:
                 self._debug_last_print[symbol] = time.time()
                 print(f"[DEBUG {symbol}] SKIP: atr_too_low atr={atr_1m_pct:.5f} "
