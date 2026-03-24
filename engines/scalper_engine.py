@@ -553,12 +553,14 @@ class ExecutionEngine:
         aggressive_wait_ms: int = SOR_AGGR_WAIT_MS,
         position_callback=None,
         cache: Optional[MarketDataCache] = None,
+        cfg: Optional[ScalperConfig] = None,
     ) -> None:
         self.exchange = exchange
         self.maker_wait_ms = maker_wait_ms
         self.aggressive_wait_ms = aggressive_wait_ms
         self.position_callback = position_callback
         self._cache = cache
+        self.cfg = cfg or ScalperConfig()
 
     @staticmethod
     def _ccxt(symbol: str) -> str:
@@ -954,6 +956,14 @@ class ExecutionEngine:
             flush=True,
         )
 
+        # Save position to disk for recovery — ONLY after successful fill
+        if self.position_callback:
+            self.position_callback(pos.symbol, pos.entry_price, pos.entry_price,
+                                   pos.sl_price, pos.tp_price,
+                                   save_to_disk=True, stake=stake,
+                                   direction=signal.direction, strategy=signal.strategy,
+                                   sl_pct=_dynamic_sl)
+
         # Retail exit model: take-profit is executed with taker (market) for fill certainty.
         fill_latency = max(time.time() - entry_start, 0.0)
         return await self._monitor(pos, ccxt_sym, fill_latency)
@@ -1214,6 +1224,7 @@ class ScalperEngine:
             aggressive_wait_ms=int(self.cfg.sor_aggressive_wait_ms),
             position_callback=self._broadcast_position,
             cache=self._cache,
+            cfg=self.cfg,
         )
         self._state    = _BotState()
         self._positions_lock = threading.Lock()
@@ -1500,6 +1511,7 @@ class ScalperEngine:
         TAKER_FEE = float(self.cfg.taker_fee)
         MAX_TRADES_DAY = int(self.cfg.max_trades_day)
         # Sync Runner/BE to executor
+        self._executor.cfg = self.cfg
         self._executor.RUNNER_TRAIL_PCT = float(self.cfg.runner_trail_pct)
         # Sync instance vars set from cfg in __init__
         self.symbol_cooldown_sec = float(self.cfg.symbol_cooldown_sec)
@@ -1565,8 +1577,23 @@ class ScalperEngine:
             except Exception:
                 pass
 
-    def _broadcast_position(self, symbol: str, entry_price: float, current_price: float, sl_price: float, tp_price: float) -> None:
+    def _broadcast_position(self, symbol: str, entry_price: float, current_price: float,
+                            sl_price: float, tp_price: float, *,
+                            save_to_disk: bool = False, stake: float = 0.0,
+                            direction: int = 1, strategy: str = "",
+                            sl_pct: float = 0.0) -> None:
         """Send live position data to web frontend via log_callback."""
+        if save_to_disk:
+            self._save_position({
+                "symbol": symbol,
+                "entry_price": entry_price,
+                "tp_price": tp_price,
+                "sl_pct": sl_pct,
+                "stake": stake,
+                "direction": direction,
+                "strategy": strategy,
+                "entry_time": time.time(),
+            })
         if self.log_callback:
             try:
                 data = json.dumps({
@@ -2851,17 +2878,7 @@ class ScalperEngine:
             self._pending_orders.add(signal.symbol)
             self._trade_rate_window.append(now)
             ml_features = self._collect_ml_features(signal.symbol, signal, features, snapshot)
-            # Zapisz pozycję na dysk przed wykonaniem — recovery na wypadek restartu
-            self._save_position({
-                "symbol": signal.symbol,
-                "entry_price": signal.entry_price,
-                "tp_price": signal.entry_price * (1 + signal.tp_pct),
-                "sl_pct": float(self.cfg.stop_loss_pct),
-                "stake": stake,
-                "direction": signal.direction,
-                "strategy": signal.strategy,
-                "entry_time": time.time(),
-            })
+            # Position saved to disk AFTER successful execution (inside _execute_and_record)
             asyncio.create_task(self._execute_and_record(signal, stake, ml_features))
 
     async def _execute_and_record(self, signal: Signal, stake: float,
@@ -2941,10 +2958,15 @@ class ScalperEngine:
             self._state.remove(signal.symbol)
             self._clear_position_file(signal.symbol)
             self._trade_ids.pop(signal.symbol, None)
-            self._retry_after[signal.symbol] = time.time() + MISSED_RETRY_COOLDOWN_SEC
+            # Longer cooldown on execution errors to prevent rapid-fire cycle
+            self._retry_after[signal.symbol] = time.time() + 30.0
             self._invalidate_balance_cache()
             self._pending_orders.discard(signal.symbol)
             self._last_trade_ts[signal.symbol] = time.time()
+            # Pause ALL signals briefly to prevent cascade
+            self._circuit_breaker_until = max(
+                self._circuit_breaker_until, time.time() + 10.0
+            )
             return
 
         self._state.remove(signal.symbol)
