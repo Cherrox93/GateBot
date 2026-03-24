@@ -2638,8 +2638,8 @@ class ScalperEngine:
                 print(f"[DEBUG {symbol}] SKIP: no_trade_flow (WS stale)", flush=True)
             return
 
-        trend_required = trend_dir == 1
-        # trend_required is no longer overridden — dual EMA filter always applies
+        # Allow trading in neutral (0) and uptrend (1), block only downtrend (-1)
+        trend_required = trend_dir >= 0
 
         impulse = self._detect_impulse(symbol)
         if impulse is not None:
