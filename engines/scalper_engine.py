@@ -2327,6 +2327,81 @@ class ScalperEngine:
                 self._handle_recovered_exit(pos, ccxt_sym, stake)
             )
 
+        # ── Exchange-based recovery: detect orphaned positions from balance ──
+        # If no file recovery found positions, scan exchange balance for held crypto
+        loop2 = asyncio.get_running_loop()
+        try:
+            all_balances = await loop2.run_in_executor(
+                None, lambda: self.exchange_client.fetch_balance()
+            )
+        except Exception as e:
+            self.log(f"[RECOVERY] fetch_balance error: {e}")
+            all_balances = {}
+
+        for gate_sym in SYMBOLS:
+            if self._state.has(gate_sym):
+                continue  # already recovered from file
+            base_currency = gate_sym.split("_")[0]
+            held = float((all_balances.get(base_currency) or {}).get("free") or 0.0)
+            if held <= 0:
+                continue
+            ccxt_sym = gate_sym.replace("_", "/")
+            try:
+                ticker = await loop2.run_in_executor(
+                    None,
+                    lambda s=ccxt_sym: self.exchange_client.fetch_ticker(s)
+                )
+                current_price = float(ticker.get("last") or ticker.get("bid") or 0.0)
+            except Exception:
+                current_price = 0.0
+            notional = held * current_price if current_price > 0 else 0.0
+            if notional < 2.0:
+                continue
+
+            # Orphaned position — use current price as entry, set TP/SL from cfg
+            _tp_pct = float(self.cfg.target_profit_pct)
+            _sl_pct = float(self.cfg.stop_loss_pct)
+            pos = OpenPosition(
+                symbol=gate_sym,
+                direction=1,
+                entry_price=current_price,
+                tp_price=current_price * (1 + _tp_pct),
+                sl_price=current_price * (1 - _sl_pct),
+                sl_pct=_sl_pct,
+                qty=held,
+                stake=round(notional, 2),
+                entry_time=time.time(),
+                entry_order_id="orphan_recovery",
+                tp_order_id="",
+                strategy="orphan_recovery",
+            )
+            self._state.add(pos)
+            recovered += 1
+
+            # Save position file for future recovery
+            self._save_position({
+                "symbol": gate_sym,
+                "entry_price": current_price,
+                "tp_price": pos.tp_price,
+                "sl_pct": _sl_pct,
+                "stake": pos.stake,
+                "direction": 1,
+                "strategy": "orphan_recovery",
+                "entry_time": time.time(),
+            })
+
+            msg = (
+                f"♻️ ORPHAN RECOVERY: {gate_sym} | held={held:.6f} {base_currency}"
+                f" | price={current_price:.4f} | value={notional:.2f}$"
+                f" | TP={pos.tp_price:.4f} | SL={pos.sl_price:.4f}"
+            )
+            self.log(msg)
+            await self._tg(msg)
+
+            asyncio.create_task(
+                self._handle_recovered_exit(pos, ccxt_sym, pos.stake)
+            )
+
         if recovered == 0:
             self.log("[RECOVERY] Brak otwartych pozycji — czyste uruchomienie")
         else:
@@ -2341,12 +2416,6 @@ class ScalperEngine:
         # Verify API connectivity and fetch real balance before starting
         self._invalidate_balance_cache()
         usdt_free = await self._get_available_balance()
-        if usdt_free <= 0:
-            msg = "⛔ SCALPER: Brak środków USDT na koncie Gate.io — bot zatrzymany"
-            self.log(msg)
-            await self._tg(msg)
-            self.running = False
-            return
         msg = f"✅ SCALPER LIVE: Połączono z Gate.io | USDT free: {usdt_free:.2f}$"
         self.log(msg)
         self.gui_log(msg)
@@ -2363,6 +2432,14 @@ class ScalperEngine:
             for p in self._state.as_dict().values()
         )
         self._start_equity = round(_fresh_bal + _pos_val, 2)
+
+        if self._start_equity <= 0:
+            stop_msg = "⛔ SCALPER: Brak środków na koncie Gate.io — bot zatrzymany"
+            self.log(stop_msg)
+            await self._tg(stop_msg)
+            self.running = False
+            return
+
         self.log(
             f"[STATS] Start equity: {self._start_equity:.2f}$ "
             f"(USDT: {_fresh_bal:.2f}$ + pozycje: {_pos_val:.2f}$)"
