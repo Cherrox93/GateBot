@@ -822,6 +822,8 @@ async def update_settings(bot: str, req: SettingsRequest, user=Depends(verify_to
         payload.update(load_scalper_settings_file())  # merge saved
         payload["stake_usd"] = req.stake_usd
         payload["max_slots"] = req.max_slots
+        # Sync base_stake_usdt with stake_usd (used for min_stake validation)
+        payload["base_stake_usdt"] = req.stake_usd
         # Merge all optional scalper fields from request
         _scalper_opt_float = [
             "target_profit_pct", "stop_loss_pct", "trailing_stop_pct", "maker_fee",

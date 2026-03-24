@@ -2821,11 +2821,18 @@ class ScalperEngine:
             min_stake = float(self.cfg.base_stake_usdt) * 0.95
             if stake < min_stake:
                 self._state.remove(signal.symbol)
-                self.log(
-                    f"[{signal.symbol}] SKIP: truly_free={truly_free:.2f}$ "
-                    f"< min_stake={min_stake:.2f}$ "
-                    f"(balance={balance_now:.2f}$ engaged={engaged:.2f}$)"
-                )
+                # Throttle: log only once per 60s per symbol
+                _bal_key = f"_bal_skip_{signal.symbol}"
+                _bal_last = getattr(self, '_bal_skip_ts', {}).get(signal.symbol, 0.0)
+                if now - _bal_last > 60.0:
+                    if not hasattr(self, '_bal_skip_ts'):
+                        self._bal_skip_ts = {}
+                    self._bal_skip_ts[signal.symbol] = now
+                    self.log(
+                        f"[{signal.symbol}] SKIP: truly_free={truly_free:.2f}$ "
+                        f"< min_stake={min_stake:.2f}$ "
+                        f"(balance={balance_now:.2f}$ engaged={engaged:.2f}$)"
+                    )
                 continue
 
             # 4. Remaining filter checks (balance already known)
