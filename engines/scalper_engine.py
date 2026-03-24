@@ -923,18 +923,20 @@ class ExecutionEngine:
             real_entry_fee_cost = 0.0
             real_entry_fee_currency = "USDT"
 
-        # Dynamic SL: at least 1.3× the 1-minute ATR, floored at STOP_LOSS_PCT
+        # Dynamic SL: at least 1.3× the 1-minute ATR, floored at cfg stop_loss_pct
         cache_ref = self._cache
         _atr = cache_ref.get_atr_1m_pct(signal.symbol) if cache_ref else 0.0
-        _dynamic_sl = max(_atr * 1.3, STOP_LOSS_PCT)
-        _dynamic_sl = min(_dynamic_sl, STOP_LOSS_PCT * 4.0)   # cap at 4× to avoid runaway SL
+        _cfg_sl = float(self.cfg.stop_loss_pct)
+        _cfg_tp = float(self.cfg.target_profit_pct)
+        _dynamic_sl = max(_atr * 1.3, _cfg_sl)
+        _dynamic_sl = min(_dynamic_sl, _cfg_sl * 4.0)   # cap at 4× to avoid runaway SL
 
         # TP/SL prices — exact user settings, no fee adjustment
         # Fees are only accounted for in PnL display/logging, not in trigger prices
         pos = OpenPosition(
             symbol=signal.symbol, direction=signal.direction,
             entry_price=real_entry_price,
-            tp_price=real_entry_price * (1 + signal.direction * TARGET_PROFIT_PCT),
+            tp_price=real_entry_price * (1 + signal.direction * _cfg_tp),
             sl_price=real_entry_price * (1 - signal.direction * _dynamic_sl),
             qty=real_entry_qty, stake=stake,
             entry_time=time.time(), entry_order_id=order_id,
@@ -947,7 +949,7 @@ class ExecutionEngine:
             f"[{signal.symbol}] OPEN entry={real_entry_price:.6f}"
             f" qty={real_entry_qty:.6f} fee={real_entry_fee_cost:.6f}{real_entry_fee_currency}"
             f" ATR={_atr:.5f} dynamic_SL={_dynamic_sl:.5f}"
-            f" TP={TARGET_PROFIT_PCT:.5f}"
+            f" TP={_cfg_tp:.5f}"
             f" tp_price={pos.tp_price:.6f} sl_price={pos.sl_price:.6f}",
             flush=True,
         )
@@ -1061,16 +1063,17 @@ class ExecutionEngine:
                 continue  # runner active — skip other checks
 
             # g) NEAR TP logging
-            if gross_pnl >= TARGET_PROFIT_PCT * 0.9:
+            _cfg_tp = float(self.cfg.target_profit_pct)
+            if _cfg_tp > 0 and gross_pnl >= _cfg_tp * 0.9:
                 print(
                     f"[{pos.symbol}] NEAR_TP gross={gross_pnl:.5f} "
-                    f"target={TARGET_PROFIT_PCT:.5f} "
+                    f"target={_cfg_tp:.5f} "
                     f"current={current:.6f} tp={pos.tp_price:.6f}",
                     flush=True,
                 )
 
             # h) RUNNER activation — Phase 2→3 transition
-            if gross_pnl >= TARGET_PROFIT_PCT:
+            if _cfg_tp > 0 and gross_pnl >= _cfg_tp:
                 # Cancel any open order so it can't fill as TP_MAKER behind our back
                 if pos.tp_order_id:
                     await self._cancel_if_open(ccxt_sym, pos.tp_order_id)
@@ -1741,6 +1744,8 @@ class ScalperEngine:
 
     def _build_momentum_pullback_signal(self, symbol: str, current_price: float, reason: str) -> Signal:
         entry = current_price
+        _tp = float(self.cfg.target_profit_pct)
+        _sl = float(self.cfg.stop_loss_pct)
         return Signal(
             symbol=symbol,
             timestamp=time.time(),
@@ -1748,10 +1753,10 @@ class ScalperEngine:
             strategy="momentum_pullback",
             strength=0.8,
             entry_price=entry,
-            tp_price=entry * (1 + TARGET_PROFIT_PCT),
-            sl_price=entry * (1 - STOP_LOSS_PCT),
-            tp_pct=TARGET_PROFIT_PCT,
-            sl_pct=STOP_LOSS_PCT,
+            tp_price=entry * (1 + _tp),
+            sl_price=entry * (1 - _sl),
+            tp_pct=_tp,
+            sl_pct=_sl,
             reason=reason,
         )
 
@@ -2671,6 +2676,8 @@ class ScalperEngine:
                     break
 
             entry = _entry_price
+            _tp = float(self.cfg.target_profit_pct)
+            _sl = float(self.cfg.stop_loss_pct)
             signals.append(
                 Signal(
                     symbol=symbol,
@@ -2679,10 +2686,10 @@ class ScalperEngine:
                     strategy="momentum_breakout",
                     strength=0.75,
                     entry_price=entry,
-                    tp_price=entry * (1 + TARGET_PROFIT_PCT),
-                    sl_price=entry * (1 - STOP_LOSS_PCT),
-                    tp_pct=TARGET_PROFIT_PCT,
-                    sl_pct=STOP_LOSS_PCT,
+                    tp_price=entry * (1 + _tp),
+                    sl_price=entry * (1 - _sl),
+                    tp_pct=_tp,
+                    sl_pct=_sl,
                     reason=f"breakout5s={price_change_5s:.4f} vol_spike pullback_entry",
                 )
             )
@@ -2713,6 +2720,8 @@ class ScalperEngine:
         # 2) FeatureEngine breakout confirmation.
         if features.breakout_detected and features.volume_spike and trend_required:
             entry = snapshot.last_price
+            _tp = float(self.cfg.target_profit_pct)
+            _sl = float(self.cfg.stop_loss_pct)
             signals.append(
                 Signal(
                     symbol=symbol,
@@ -2721,10 +2730,10 @@ class ScalperEngine:
                     strategy="micro_breakout",
                     strength=0.7,
                     entry_price=entry,
-                    tp_price=entry * (1 + TARGET_PROFIT_PCT),
-                    sl_price=entry * (1 - STOP_LOSS_PCT),
-                    tp_pct=TARGET_PROFIT_PCT,
-                    sl_pct=STOP_LOSS_PCT,
+                    tp_price=entry * (1 + _tp),
+                    sl_price=entry * (1 - _sl),
+                    tp_pct=_tp,
+                    sl_pct=_sl,
                     reason="feature_breakout+volume_spike",
                 )
             )
@@ -2834,7 +2843,7 @@ class ScalperEngine:
             # signal.tp_pct is only the runner activation threshold (e.g. 0.5%)
             # The real exit is runner trailing, conservatively estimated at 2× TP
             _atr_now = self._cache.get_atr_1m_pct(signal.symbol)
-            _eff_sl = max(_atr_now * 1.3, STOP_LOSS_PCT)
+            _eff_sl = max(_atr_now * 1.3, float(self.cfg.stop_loss_pct))
             _expected_exit_pct = signal.tp_pct * 2.0   # runner adds at minimum 1× TP beyond trigger
             _net_reward = _expected_exit_pct - (MAKER_FEE + TAKER_FEE)
             _net_risk   = _eff_sl            + (MAKER_FEE + TAKER_FEE)
