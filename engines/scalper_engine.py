@@ -2229,8 +2229,7 @@ class ScalperEngine:
 
         position_files = _glob.glob("position_*.json")
         if not position_files:
-            self.log("[RECOVERY] Brak zapisanych pozycji — czyste uruchomienie")
-            return
+            self.log("[RECOVERY] Brak zapisanych pozycji — sprawdzam giełdę...")
 
         for filepath in position_files:
             try:
@@ -2337,6 +2336,18 @@ class ScalperEngine:
         except Exception as e:
             self.log(f"[RECOVERY] fetch_balance error: {e}")
             all_balances = {}
+
+        # Debug: show what balances we found
+        _nonzero = {
+            k: v for k, v in all_balances.items()
+            if isinstance(v, dict) and float(v.get("free") or 0) > 0
+            and k not in ("info", "free", "used", "total", "debt",
+                          "timestamp", "datetime", "USDT")
+        }
+        if _nonzero:
+            self.log(f"[RECOVERY] Non-zero balances: { {k: v.get('free') for k, v in _nonzero.items()} }")
+        else:
+            self.log("[RECOVERY] No non-zero crypto balances found on exchange")
 
         for gate_sym in SYMBOLS:
             if self._state.has(gate_sym):
